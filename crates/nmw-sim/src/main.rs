@@ -1,19 +1,14 @@
-//! Deterministic multi-node simulator for the NMW mesh protocol.
-//!
-//! Nodes are placed at random in a square area. A transmission reaches every
-//! node within radio range unless it collides with another overlapping
-//! transmission audible at the receiver (unless it is at least 6 dB stronger:
-//! LoRa capture effect), the receiver is
-//! itself transmitting, or it is dropped by the random per-link loss.
-//! Senders use listen-before-talk with random backoff, as the firmware will.
+//! Deterministic multi-node benchmark for the NMW mesh protocol: random
+//! topologies, a message workload, and delivery statistics. The radio model
+//! is in the `nmw_sim` library.
 
 use nmw_core::{port, Address, Event, Identity, LoraProfile, Node, NodeConfig, Role};
+use nmw_sim::{Medium, Topology, TopologyParams, S};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use std::collections::{BTreeMap, HashMap};
 use std::process::ExitCode;
 
-const S: u64 = 1_000_000;
 /// Each node announces twice while the mesh warms up (once in each window,
 /// as nodes boot at different times), then every few hours.
 const ANNOUNCE_ROUNDS: [(u64, u64); 2] = [(0, 300 * S), (600 * S, 900 * S)];
@@ -21,8 +16,6 @@ const REANNOUNCE: u64 = 3 * 3600 * S;
 /// Message traffic starts once both announce rounds are over.
 const TRAFFIC_START: u64 = 960 * S;
 const DUTY_CYCLE_LIMIT: f64 = 0.10;
-/// LoRa co-channel capture: a frame survives overlap if it is this much stronger than each interferer.
-const CAPTURE_DB: f32 = 6.0;
 
 struct Args {
     nodes: usize,
@@ -98,111 +91,6 @@ so delivery does not depend on hearing announces.
 --min-delivery gates on the share of all messages delivered. Messages to a
 destination the sender has not heard an announce from wait for a contact request.";
 
-struct Topology {
-    pos: Vec<(f64, f64)>,
-    range: f64,
-    neighbours: Vec<Vec<usize>>,
-}
-
-impl Topology {
-    fn dist(&self, a: usize, b: usize) -> f64 {
-        let (x1, y1) = self.pos[a];
-        let (x2, y2) = self.pos[b];
-        ((x1 - x2).powi(2) + (y1 - y2).powi(2)).sqrt()
-    }
-
-    fn in_range(&self, a: usize, b: usize) -> bool {
-        a != b && self.dist(a, b) <= self.range
-    }
-
-    /// Linear SNR model: +10 dB next to the sender, -15 dB at the edge of range.
-    fn snr(&self, a: usize, b: usize) -> f32 {
-        (10.0 - 25.0 * self.dist(a, b) / self.range) as f32
-    }
-
-    /// Place nodes until repeaters form a connected backbone and every client hears a repeater.
-    fn generate(args: &Args, rng: &mut SmallRng) -> Topology {
-        for _ in 0..10_000 {
-            let pos: Vec<(f64, f64)> = (0..args.nodes)
-                .map(|_| {
-                    (
-                        rng.gen::<f64>() * args.area_m,
-                        rng.gen::<f64>() * args.area_m,
-                    )
-                })
-                .collect();
-            let mut t = Topology {
-                pos,
-                range: args.range_m,
-                neighbours: Vec::new(),
-            };
-            t.neighbours = (0..args.nodes)
-                .map(|i| (0..args.nodes).filter(|&j| t.in_range(i, j)).collect())
-                .collect();
-            let reps = 0..args.repeaters;
-            let clients_ok = (args.repeaters..args.nodes)
-                .all(|c| t.neighbours[c].iter().any(|&n| reps.contains(&n)));
-            if clients_ok && t.backbone_connected(args.repeaters) {
-                return t;
-            }
-        }
-        panic!("could not generate a connected topology; increase --range or --repeaters");
-    }
-
-    /// Fewest radio hops from `a` to `b` when only repeaters relay.
-    fn hops(&self, a: usize, b: usize, repeaters: usize) -> usize {
-        let mut dist = vec![usize::MAX; self.pos.len()];
-        let mut queue = std::collections::VecDeque::from([a]);
-        dist[a] = 0;
-        while let Some(i) = queue.pop_front() {
-            if i == b {
-                return dist[i];
-            }
-            if i != a && i >= repeaters {
-                continue;
-            }
-            for &j in &self.neighbours[i] {
-                if dist[j] == usize::MAX {
-                    dist[j] = dist[i] + 1;
-                    queue.push_back(j);
-                }
-            }
-        }
-        usize::MAX
-    }
-
-    fn backbone_connected(&self, repeaters: usize) -> bool {
-        let mut seen = vec![false; repeaters];
-        let mut stack = vec![0];
-        seen[0] = true;
-        while let Some(i) = stack.pop() {
-            for &j in &self.neighbours[i] {
-                if j < repeaters && !seen[j] {
-                    seen[j] = true;
-                    stack.push(j);
-                }
-            }
-        }
-        seen.iter().all(|&s| s)
-    }
-}
-
-struct Tx {
-    from: usize,
-    start: u64,
-    end: u64,
-    frame: Vec<u8>,
-    done: bool,
-}
-
-#[derive(Default)]
-struct Radio {
-    pending: Option<Vec<u8>>,
-    ready_at: u64,
-    busy_until: u64,
-    airtime: u64,
-}
-
 struct Sent {
     at: u64,
     hops: usize,
@@ -262,8 +150,13 @@ impl Stats {
 
 fn simulate(args: &Args, seed: u64) -> Stats {
     let mut rng = SmallRng::seed_from_u64(seed);
-    let topo = Topology::generate(args, &mut rng);
-    let profile = LoraProfile::MEDIUM;
+    let params = TopologyParams {
+        nodes: args.nodes,
+        repeaters: args.repeaters,
+        area_m: args.area_m,
+        range_m: args.range_m,
+    };
+    let topo = Topology::generate(&params, &mut rng);
 
     let mut identities = Vec::with_capacity(args.nodes);
     let mut nodes: Vec<Node> = (0..args.nodes)
@@ -296,7 +189,6 @@ fn simulate(args: &Args, seed: u64) -> Stats {
         .enumerate()
         .map(|(i, n)| (n.address(), i))
         .collect();
-    let mut radios: Vec<Radio> = (0..args.nodes).map(|_| Radio::default()).collect();
     let mut announces: Vec<Vec<u64>> = (0..args.nodes)
         .map(|_| {
             ANNOUNCE_ROUNDS
@@ -306,6 +198,7 @@ fn simulate(args: &Args, seed: u64) -> Stats {
                 .collect()
         })
         .collect();
+    let mut medium = Medium::new(topo, LoraProfile::MEDIUM, args.loss, rng.gen());
 
     let interval = (args.interval_s * S as f64) as u64;
     let end = TRAFFIC_START + interval * args.messages as u64 + 180 * S;
@@ -313,34 +206,9 @@ fn simulate(args: &Args, seed: u64) -> Stats {
     let mut sent: HashMap<(usize, usize, u16), Sent> = HashMap::new();
     let mut st = Stats::default();
 
-    let mut txs: Vec<Tx> = Vec::new();
     let mut t = 0u64;
     while t <= end {
-        // Finish transmissions and deliver them.
-        for k in 0..txs.len() {
-            if txs[k].done || txs[k].end > t {
-                continue;
-            }
-            txs[k].done = true;
-            let tx = &txs[k];
-            for &r in &topo.neighbours[tx.from] {
-                st.receptions += 1;
-                let snr = topo.snr(tx.from, r);
-                let collided = txs.iter().enumerate().any(|(m, o)| {
-                    m != k
-                        && o.start < tx.end
-                        && o.end > tx.start
-                        && (o.from == r
-                            || (topo.in_range(o.from, r) && snr < topo.snr(o.from, r) + CAPTURE_DB))
-                });
-                if collided {
-                    st.collisions += 1;
-                } else if rng.gen::<f64>() >= args.loss {
-                    nodes[r].handle_frame(&tx.frame, snr, t);
-                }
-            }
-        }
-        txs.retain(|o| !o.done || o.end + 2 * S > t);
+        medium.deliver(&mut nodes, t);
 
         // Application workload.
         for i in 0..args.nodes {
@@ -369,7 +237,7 @@ fn simulate(args: &Args, seed: u64) -> Stats {
                 (src, dst, seq),
                 Sent {
                     at: t,
-                    hops: topo.hops(src, dst, args.repeaters),
+                    hops: medium.topology.hops(src, dst, args.repeaters),
                     known,
                     delivered_at: None,
                     acked: false,
@@ -377,10 +245,10 @@ fn simulate(args: &Args, seed: u64) -> Stats {
             );
         }
 
-        // Node timers, events and radios.
-        for i in 0..args.nodes {
-            nodes[i].tick(t);
-            while let Some(ev) = nodes[i].poll_event() {
+        // Node timers and events.
+        for (i, node) in nodes.iter_mut().enumerate() {
+            node.tick(t);
+            while let Some(ev) = node.poll_event() {
                 match ev {
                     Event::Message { from, seq, .. } => {
                         if let Some(s) = sent.get_mut(&(index[&from], i, seq)) {
@@ -399,65 +267,18 @@ fn simulate(args: &Args, seed: u64) -> Stats {
                     Event::Failed { .. } | Event::Contact { .. } => {}
                 }
             }
-            let radio = &mut radios[i];
-            if radio.busy_until > t {
-                continue;
-            }
-            if radio.pending.is_none() {
-                radio.pending = nodes[i].poll_transmit(t);
-                radio.ready_at = t;
-            }
-            let Some(frame_len) = radio.pending.as_ref().map(|f| f.len()) else {
-                continue;
-            };
-            if radio.ready_at > t {
-                continue;
-            }
-            // Listen before talk.
-            let busy = txs
-                .iter()
-                .any(|o| o.start <= t && o.end > t && topo.in_range(o.from, i));
-            let air = profile.airtime_us(frame_len);
-            if busy {
-                radio.ready_at = t + rng.gen_range(5_000..air.max(5_001));
-            } else {
-                let frame = radio.pending.take().expect("checked above");
-                radio.busy_until = t + air;
-                radio.airtime += air;
-                st.transmissions += 1;
-                txs.push(Tx {
-                    from: i,
-                    start: t,
-                    end: t + air,
-                    frame,
-                    done: false,
-                });
-            }
         }
+        medium.transmit(&mut nodes, t);
 
         // Advance to the next thing that can happen.
-        let mut next = u64::MAX;
-        let mut consider = |c: u64| {
-            if c > t && c < next {
-                next = c;
-            }
-        };
-        txs.iter().filter(|o| !o.done).for_each(|o| consider(o.end));
-        for (i, r) in radios.iter().enumerate() {
-            consider(r.busy_until);
-            if r.pending.is_some() {
-                consider(r.ready_at);
-            }
-            if let Some(w) = nodes[i].next_wakeup() {
-                consider(w);
+        let mut next = medium.next_event(&nodes, t).unwrap_or(u64::MAX);
+        for &a in announces.iter().filter_map(|a| a.last()) {
+            if a > t {
+                next = next.min(a);
             }
         }
-        announces
-            .iter()
-            .filter_map(|a| a.last())
-            .for_each(|&a| consider(a));
         if next_msg < args.messages {
-            consider(TRAFFIC_START + interval * next_msg as u64);
+            next = next.min(TRAFFIC_START + interval * next_msg as u64);
         }
         if next == u64::MAX {
             break;
@@ -479,9 +300,14 @@ fn simulate(args: &Args, seed: u64) -> Stats {
         }
         st.acked += s.acked as usize;
     }
-    st.max_duty = radios
+    st.transmissions = medium.stats.transmissions;
+    st.receptions = medium.stats.receptions;
+    st.collisions = medium.stats.collisions;
+    st.max_duty = medium
+        .stats
+        .airtime
         .iter()
-        .map(|r| r.airtime as f64 / end as f64)
+        .map(|&a| a as f64 / end as f64)
         .fold(0.0, f64::max);
     let clients = args.repeaters..args.nodes;
     st.pairs = clients.len() * (clients.len() - 1);
