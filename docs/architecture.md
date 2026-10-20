@@ -71,7 +71,8 @@ The **same core library** implements Link → Transport and is shared by firmwar
 - **Channels (groups):** identified by `hash(channel_key)[0..2]` on air plus the channel name locally.
 - **Services:** a node exposes ports; well-known ports: 1 text, 2 receipts, 3 voice note, 4 live voice, 5 file/resource, 6 position, 7 telemetry, 8 bot command, 9 gateway control, 100+ app-defined.
 - **Human names** are just signed fields in announces; never trusted for identity. Contacts are pinned by full address (TOFU + optional QR verification).
-- **Contacts** come from announces or are shared out of band (QR code / contact file). A sender that has not yet heard back from a contact uses `DATA_KEY` (see §5), so the receiver can decrypt even if it never heard the sender's announce.
+- **Contacts** come from announces, from a contact request, or are shared out of band (QR code / contact file). A sender that has not yet heard back from a contact uses `DATA_KEY` (see §5), so the receiver can decrypt even if it never heard the sender's announce.
+- **Contact request:** sending to a full address with no known key floods a `CTRL` contact request (`subtype 1 | full address(16)`); the target answers with its announce, source-routed back along the request's path, at most once per 10 s per requester. The message waits and goes out as soon as the announce arrives; up to 4 requests before the send fails.
 
 ## 5. Packet format
 
@@ -90,7 +91,7 @@ Byte   Field
 
 - **packet_id is 32-bit** (not 16) because it forms the AEAD nonce with `src`; a 16-bit counter would wrap within days on a busy node. Firmware persists the counter (or restarts it from a random value) across reboots.
 - **AAD** = version, type, routed, ack_req, packet_id, dst, src. The hop counters and path are excluded because repeaters change them.
-- **Types:** `DATA` (0), `ACK` (1), `ANNOUNCE` (2), `GROUP` (3, reserved), `CTRL` (4, reserved), `DATA_KEY` (5: DATA prefixed with the sender's 32-byte public key).
+- **Types:** `DATA` (0), `ACK` (1), `ANNOUNCE` (2, flooded, or source-routed when answering a contact request), `GROUP` (3, reserved), `CTRL` (4: subtype 1 = contact request), `DATA_KEY` (5: DATA prefixed with the sender's 32-byte public key).
 - **Payloads:**
   - `DATA`: AEAD(`seq(2) | port(2) | data`) + 8-byte tag. `seq` is the end-to-end message number used for ACKs and duplicate suppression; every (re)transmission gets a fresh packet_id. Max application data: 181 bytes.
   - `ACK`: AEAD(`seq(2) | has_fwd_path(1) | fwd_path`). When the DATA arrived by flood, the ACK carries the path it took so the sender learns the route.
@@ -255,17 +256,17 @@ Gateway = ESP32 node or a radio attached to a Linux box running the gateway daem
 
 **Alternative worth considering:** build NMW apps on top of Reticulum or MeshCore instead of a new protocol. Faster to ship, but we'd inherit Reticulum's Python-centric stack (hard to run on nRF52) or MeshCore's narrower scope. Recommended only if speed to a first usable app matters more than owning the protocol.
 
-### M0 simulator results (2026-10-20)
+### Simulator results (2026-10-20)
 
 `nmw-sim`: 50 nodes (15 repeaters, 35 clients) in 6×6 km, 2 km range, SF9/BW250, collisions with 6 dB capture, listen-before-talk; 300 messages per run at one every 10 s, 20 random topologies.
 
-| Per-link loss | Delivered (contacts shared by QR) | p95 latency | Contacts learned from announces only |
+| Per-link loss | Delivered, contacts from announces + contact requests | Delivered, contacts shared by QR | p95 latency (announces) |
 |---|---|---|---|
-| 0% | 100% | 1.3 s | 97% |
-| 20% | 99.2% | 4.7 s | 92% |
-| 30% | 97.3% | 29 s | 87% |
+| 0% | 99.6% | 100% | 1.5 s |
+| 20% | 98.5% | 99.2% | 13 s |
+| 30% | 94.7% | 97.3% | 45 s |
 
-With announce-only discovery, delivery to known contacts stays ≥ 99.8% at 20–30% loss; the gap is discovery itself (announces lost twice). Fix planned: an on-demand contact/path request.
+At 0% loss every failure is a pair more than 7 radio hops apart, beyond the 6-repeater hop limit. Contact requests lifted announce-only delivery at 20% loss from 91% to 98.5%.
 
 ## 15. Roadmap
 

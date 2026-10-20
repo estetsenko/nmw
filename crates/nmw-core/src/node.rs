@@ -43,6 +43,11 @@ pub const MAX_DATA: usize =
 /// Per-hop retransmissions of a source-routed packet.
 pub const HOP_RETRIES: u8 = 2;
 
+/// CTRL subtype: "send me your announce", flooded towards a full address.
+const CTRL_CONTACT_REQ: u8 = 1;
+/// A node answers contact requests from the same requester at most this often.
+const CONTACT_REPLY_GAP: Micros = 10_000_000;
+
 const PRIO_ACK: u8 = 0;
 const PRIO_FORWARD: u8 = 1;
 const PRIO_DATA: u8 = 2;
@@ -117,8 +122,7 @@ pub enum Event {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SendError {
-    /// No announce has been received from the destination yet.
-    UnknownContact,
+    /// More than [`MAX_DATA`] bytes.
     TooLarge,
 }
 
@@ -191,6 +195,9 @@ struct HopPending {
 
 struct Outgoing {
     to: ShortAddr,
+    to_addr: Address,
+    /// Waiting for the destination's announce (requested with a contact request).
+    awaiting_contact: bool,
     seq: u16,
     port: u16,
     data: Vec<u8>,
@@ -213,6 +220,7 @@ pub struct Node {
     hop_pending: Vec<HopPending>,
     outgoing: Vec<Outgoing>,
     events: VecDeque<Event>,
+    contact_replies: BTreeMap<ShortAddr, Micros>,
     next_id: u32,
     next_seq: u16,
     last_prune: Micros,
@@ -240,6 +248,7 @@ impl Node {
             hop_pending: Vec::new(),
             outgoing: Vec::new(),
             events: VecDeque::new(),
+            contact_replies: BTreeMap::new(),
             next_id,
             next_seq,
             last_prune: now,
@@ -343,15 +352,6 @@ impl Node {
     /// Flood an announce carrying this node's public keys, role and name.
     pub fn announce(&mut self, now: Micros) {
         let id = self.alloc_id();
-        let name = self.config.name.as_bytes();
-        let name = &name[..name.len().min(MAX_NAME)];
-        let mut payload = Vec::with_capacity(PublicIdentity::LEN + 2 + name.len() + 64);
-        payload.extend_from_slice(&self.identity.public().to_bytes());
-        payload.push(self.config.role as u8);
-        payload.push(name.len() as u8);
-        payload.extend_from_slice(name);
-        let sig = self.identity.sign(&announce_signed_bytes(id, &payload));
-        payload.extend_from_slice(&sig);
         let packet = Packet {
             ptype: PacketType::Announce,
             routed: false,
@@ -362,13 +362,96 @@ impl Node {
             dst: ShortAddr::BROADCAST,
             src: self.me,
             path: Vec::new(),
-            payload,
+            payload: self.announce_payload(id),
         };
         self.enqueue(now, PRIO_ANNOUNCE, packet.encode(), None, None);
     }
 
+    /// Ask the node with full address `addr` to send us its announce.
+    /// [`Node::send`] does this by itself for unknown destinations.
+    pub fn request_contact(&mut self, addr: &Address, now: Micros) {
+        let id = self.alloc_id();
+        let mut payload = Vec::with_capacity(1 + 16);
+        payload.push(CTRL_CONTACT_REQ);
+        payload.extend_from_slice(&addr.0);
+        let packet = Packet {
+            ptype: PacketType::Ctrl,
+            routed: false,
+            ack_req: false,
+            hop_limit: self.config.hop_limit,
+            hop_count: 0,
+            id,
+            dst: addr.short(),
+            src: self.me,
+            path: Vec::new(),
+            payload,
+        };
+        self.enqueue(now, PRIO_DATA, packet.encode(), None, None);
+    }
+
+    fn on_ctrl(&mut self, packet: &Packet, now: Micros) {
+        let p = &packet.payload;
+        if p.len() != 17 || p[0] != CTRL_CONTACT_REQ || p[1..] != self.address().0 {
+            return;
+        }
+        if self
+            .contact_replies
+            .get(&packet.src)
+            .is_some_and(|&t| now < t + CONTACT_REPLY_GAP)
+        {
+            return;
+        }
+        self.contact_replies.insert(packet.src, now);
+        // Answer with our announce, source-routed back along the request's path.
+        let id = self.alloc_id();
+        let path = reversed(&packet.path);
+        let hop = (!path.is_empty()).then(|| {
+            HopWatch::new(
+                Watch::Forwarded {
+                    key: (self.me, id),
+                    hop_count: 0,
+                },
+                None,
+            )
+        });
+        let reply = Packet {
+            ptype: PacketType::Announce,
+            routed: true,
+            ack_req: false,
+            hop_limit: self.config.hop_limit,
+            hop_count: 0,
+            id,
+            dst: packet.src,
+            src: self.me,
+            path,
+            payload: self.announce_payload(id),
+        };
+        let frame = reply.encode();
+        // Let repeaters finish rebroadcasting the request first, or the reply
+        // collides with them near the requester.
+        let request_air = self.airtime(packet.encoded_len());
+        let delay = max_flood_delay(request_air) + self.rng.below(request_air + 1);
+        self.enqueue(now + delay, PRIO_FORWARD, frame, None, hop);
+    }
+
+    fn announce_payload(&self, id: u32) -> Vec<u8> {
+        let name = self.config.name.as_bytes();
+        let name = &name[..name.len().min(MAX_NAME)];
+        let mut payload = Vec::with_capacity(PublicIdentity::LEN + 2 + name.len() + 64);
+        payload.extend_from_slice(&self.identity.public().to_bytes());
+        payload.push(self.config.role as u8);
+        payload.push(name.len() as u8);
+        payload.extend_from_slice(name);
+        let sig = self.identity.sign(&announce_signed_bytes(id, &payload));
+        payload.extend_from_slice(&sig);
+        payload
+    }
+
     /// Send `data` reliably to `to` on `port`. Returns the message sequence number
     /// reported later in [`Event::Delivered`] or [`Event::Failed`].
+    ///
+    /// If `to` is not a known contact yet, the message waits while the node
+    /// floods contact requests for it.
     pub fn send(
         &mut self,
         to: &Address,
@@ -376,16 +459,16 @@ impl Node {
         data: &[u8],
         now: Micros,
     ) -> Result<u16, SendError> {
-        if self.contact(to).is_none() {
-            return Err(SendError::UnknownContact);
-        }
         if data.len() > MAX_DATA {
             return Err(SendError::TooLarge);
         }
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
+        let awaiting_contact = self.contact(to).is_none();
         self.outgoing.push(Outgoing {
             to: to.short(),
+            to_addr: *to,
+            awaiting_contact,
             seq,
             port,
             data: data.into(),
@@ -396,8 +479,36 @@ impl Node {
             deadline: now,
         });
         let i = self.outgoing.len() - 1;
-        self.transmit_outgoing(i, now);
+        if awaiting_contact {
+            self.request_contact_for(i, now);
+        } else {
+            self.transmit_outgoing(i, now);
+        }
         Ok(seq)
+    }
+
+    fn request_contact_for(&mut self, i: usize, now: Micros) {
+        let to = self.outgoing[i].to_addr;
+        self.request_contact(&to, now);
+        let reply_len = HEADER_LEN + 1 + MAX_PATH + PublicIdentity::LEN + 2 + MAX_NAME + 64;
+        let timeout = self.round_trip_timeout(reply_len, self.config.hop_limit as usize);
+        let jitter = self.rng.below(timeout / 4 + 1);
+        let o = &mut self.outgoing[i];
+        o.attempts += 1;
+        o.deadline = now + timeout + jitter;
+    }
+
+    /// Start sending messages whose destination has just become known.
+    fn release_awaiting(&mut self, now: Micros) {
+        for i in 0..self.outgoing.len() {
+            let o = &self.outgoing[i];
+            if o.awaiting_contact && self.contact(&o.to_addr).is_some() {
+                let o = &mut self.outgoing[i];
+                o.awaiting_contact = false;
+                o.attempts = 0;
+                self.transmit_outgoing(i, now);
+            }
+        }
     }
 
     fn transmit_outgoing(&mut self, i: usize, now: Micros) {
@@ -525,6 +636,7 @@ impl Node {
         }
         self.seen.insert(key, now + SEEN_TTL);
 
+        let known = self.contacts.len();
         match packet.ptype {
             PacketType::Announce => {
                 self.on_announce(&packet);
@@ -532,7 +644,11 @@ impl Node {
             }
             PacketType::Data | PacketType::DataKey if for_me => self.on_data(&packet, now),
             PacketType::Ack if for_me => self.on_ack(&packet),
+            PacketType::Ctrl if for_me => self.on_ctrl(&packet, now),
             _ => self.forward(packet, snr_db, now),
+        }
+        if self.contacts.len() != known {
+            self.release_awaiting(now);
         }
     }
 
@@ -838,8 +954,12 @@ impl Node {
         if now >= self.last_prune + PRUNE_EVERY {
             self.seen.retain(|_, exp| *exp > now);
             self.delivered.retain(|_, exp| *exp > now);
+            self.contact_replies
+                .retain(|_, t| now < *t + CONTACT_REPLY_GAP);
             self.last_prune = now;
         }
+        // Contacts can also arrive through add_contact.
+        self.release_awaiting(now);
         let mut k = 0;
         while k < self.hop_pending.len() {
             if self.hop_pending[k].deadline > now {
@@ -872,12 +992,15 @@ impl Node {
             }
             if o.attempts > self.config.max_retries {
                 let o = self.outgoing.remove(i);
-                if let Some(c) = self.contacts.get(&o.to) {
-                    self.events.push_back(Event::Failed {
-                        to: c.addr,
-                        seq: o.seq,
-                    });
-                }
+                self.events.push_back(Event::Failed {
+                    to: o.to_addr,
+                    seq: o.seq,
+                });
+                continue;
+            }
+            if o.awaiting_contact {
+                self.request_contact_for(i, now);
+                i += 1;
                 continue;
             }
             if o.last_routed && o.routed_attempts >= 2 {
@@ -1078,14 +1201,12 @@ mod tests {
     }
 
     #[test]
-    fn unknown_contact_and_too_large() {
-        let mut a = node(1, Role::Client);
-        let b = node(2, Role::Client).address();
-        assert_eq!(a.send(&b, 1, b"x", 0), Err(SendError::UnknownContact));
-        let mut nodes = vec![a, node(2, Role::Client)];
+    fn too_large() {
+        let mut nodes = vec![node(1, Role::Client), node(2, Role::Client)];
         nodes[1].announce(0);
         run(&mut nodes, &[vec![1], vec![0]], 0, 1_000_000);
-        a = nodes.remove(0);
+        let b = nodes[1].address();
+        let a = &mut nodes[0];
         assert_eq!(
             a.send(&b, 1, &[0; MAX_DATA + 1], 0),
             Err(SendError::TooLarge)
@@ -1093,6 +1214,39 @@ mod tests {
         assert!(a.send(&b, 1, &[0; MAX_DATA], 0).is_ok());
         let frame = a.poll_transmit(0).unwrap();
         assert!(frame.len() <= MAX_FRAME - 1 - MAX_PATH);
+    }
+
+    #[test]
+    fn contact_request_finds_unknown_destination() {
+        // No announces at all: A only knows B's address (say, typed in). A <-> R <-> B.
+        let mut nodes = vec![
+            node(1, Role::Client),
+            node(3, Role::Repeater),
+            node(2, Role::Client),
+        ];
+        let links = vec![vec![1], vec![0, 2], vec![1]];
+        let a = nodes[0].address();
+        let b = nodes[2].address();
+        let seq = nodes[0].send(&b, 1, b"found you", 0).unwrap();
+        let first = Packet::decode(&nodes[0].poll_transmit(0).unwrap()).unwrap();
+        assert_eq!(first.ptype, PacketType::Ctrl);
+        nodes[1].handle_frame(&first.encode(), 0.0, 1_000);
+
+        let ev = run(&mut nodes, &links, 1_000, 20_000_000);
+        assert_eq!(messages(&ev, 2), vec![b"found you".to_vec()]);
+        assert!(ev.contains(&(0, Event::Delivered { to: b, seq })));
+        assert!(nodes[0].knows(&b) && nodes[2].knows(&a));
+        assert_eq!(nodes[0].pending_messages(), 0);
+    }
+
+    #[test]
+    fn contact_request_to_absent_node_fails() {
+        let mut nodes = vec![node(1, Role::Client), node(3, Role::Repeater)];
+        let ghost = node(9, Role::Client).address();
+        let seq = nodes[0].send(&ghost, 1, b"anyone?", 0).unwrap();
+        let ev = run(&mut nodes, &[vec![1], vec![0]], 0, 300_000_000);
+        assert!(ev.contains(&(0, Event::Failed { to: ghost, seq })));
+        assert_eq!(nodes[0].pending_messages(), 0);
     }
 
     #[test]

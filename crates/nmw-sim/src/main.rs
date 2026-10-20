@@ -95,7 +95,8 @@ const USAGE: &str = "usage: nmw-sim [--nodes 50] [--repeaters 15] [--loss 0.2] [
 Runs --seeds independent topologies (seeds seed..seed+seeds) and reports totals.
 --shared-contacts preloads every client's contacts (as if exchanged by QR code),
 so delivery does not depend on hearing announces.
---min-delivery gates on messages delivered out of those sent to a known contact.";
+--min-delivery gates on the share of all messages delivered. Messages to a
+destination the sender has not heard an announce from wait for a contact request.";
 
 struct Topology {
     pos: Vec<(f64, f64)>,
@@ -205,6 +206,8 @@ struct Radio {
 struct Sent {
     at: u64,
     hops: usize,
+    /// The sender knew the destination when the message was sent.
+    known: bool,
     delivered_at: Option<u64>,
     acked: bool,
 }
@@ -212,7 +215,8 @@ struct Sent {
 #[derive(Default)]
 struct Stats {
     sent: usize,
-    no_contact: usize,
+    unknown: usize,
+    unknown_delivered: usize,
     delivered: usize,
     acked: usize,
     duplicates: usize,
@@ -231,7 +235,8 @@ struct Stats {
 impl Stats {
     fn merge(&mut self, o: Stats) {
         self.sent += o.sent;
-        self.no_contact += o.no_contact;
+        self.unknown += o.unknown;
+        self.unknown_delivered += o.unknown_delivered;
         self.delivered += o.delivered;
         self.acked += o.acked;
         self.duplicates += o.duplicates;
@@ -356,21 +361,20 @@ fn simulate(args: &Args, seed: u64) -> Stats {
             }
             let to = nodes[dst].address();
             let text = format!("msg {next_msg}");
-            match nodes[src].send(&to, port::TEXT, text.as_bytes(), t) {
-                Ok(seq) => {
-                    let hops = topo.hops(src, dst, args.repeaters);
-                    sent.insert(
-                        (src, dst, seq),
-                        Sent {
-                            at: t,
-                            hops,
-                            delivered_at: None,
-                            acked: false,
-                        },
-                    );
-                }
-                Err(_) => st.no_contact += 1,
-            }
+            let known = nodes[src].knows(&to);
+            let seq = nodes[src]
+                .send(&to, port::TEXT, text.as_bytes(), t)
+                .expect("short text fits in one packet");
+            sent.insert(
+                (src, dst, seq),
+                Sent {
+                    at: t,
+                    hops: topo.hops(src, dst, args.repeaters),
+                    known,
+                    delivered_at: None,
+                    acked: false,
+                },
+            );
         }
 
         // Node timers, events and radios.
@@ -466,8 +470,10 @@ fn simulate(args: &Args, seed: u64) -> Stats {
     for s in sent.values() {
         let e = st.by_hops.entry(s.hops).or_default();
         e.0 += 1;
+        st.unknown += !s.known as usize;
         if let Some(d) = s.delivered_at {
             st.delivered += 1;
+            st.unknown_delivered += !s.known as usize;
             e.1 += 1;
             st.latencies.push((d - s.at) as f64 / S as f64);
         }
@@ -540,7 +546,6 @@ fn main() -> ExitCode {
             .unwrap_or(0.0)
     };
     let (p50, p95, max) = (q(0.5), q(0.95), q(1.0));
-    let attempted = total.sent + total.no_contact;
     let hops: Vec<String> = total
         .by_hops
         .iter()
@@ -549,7 +554,7 @@ fn main() -> ExitCode {
 
     println!("total over {} seeds", args.seeds);
     println!(
-        "  delivered           {} of {} sent to known contacts ({:.1}%)",
+        "  delivered           {} of {} sent ({:.1}%)",
         total.delivered,
         total.sent,
         total.delivery() * 100.0
@@ -560,10 +565,13 @@ fn main() -> ExitCode {
         total.duplicates
     );
     println!(
-        "  discovery           {:.1}% of client pairs known; {} of {} sends had no contact",
-        pct(total.known_pairs, total.pairs),
-        total.no_contact,
-        attempted
+        "  discovery           {:.1}% of client pairs known at the end",
+        pct(total.known_pairs, total.pairs)
+    );
+    println!(
+        "  unknown at send     {} messages, {:.1}% delivered after a contact request",
+        total.unknown,
+        pct(total.unknown_delivered, total.unknown)
     );
     println!("  delivered by hops   {}", hops.join("  "));
     println!("  latency             p50 {p50:.2}s  p95 {p95:.2}s  max {max:.2}s");
