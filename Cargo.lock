@@ -1978,6 +1978,7 @@ dependencies = [
  "nmw-host",
  "rand",
  "serde",
+ "serde_json",
  "tauri",
  "tauri-build",
 ]

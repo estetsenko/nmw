@@ -2,7 +2,7 @@
 //! topologies, a message workload, and delivery statistics. The radio model
 //! is in the `nmw_sim` library.
 
-use nmw_core::{port, Address, Event, Identity, LoraProfile, Node, NodeConfig, Role};
+use nmw_core::{port, Address, Channel, Event, Identity, LoraProfile, Node, NodeConfig, Role};
 use nmw_sim::{Medium, Topology, TopologyParams, S};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
@@ -28,6 +28,7 @@ struct Args {
     seed: u64,
     seeds: u64,
     shared_contacts: bool,
+    group: bool,
     min_delivery: Option<f64>,
 }
 
@@ -44,6 +45,7 @@ impl Args {
             seed: 1,
             seeds: 5,
             shared_contacts: false,
+            group: false,
             min_delivery: None,
         };
         let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -54,6 +56,10 @@ impl Args {
             }
             if flag == "--shared-contacts" {
                 a.shared_contacts = true;
+                continue;
+            }
+            if flag == "--group" {
+                a.group = true;
                 continue;
             }
             let value = it.next().ok_or(format!("missing value for {flag}"))?;
@@ -83,11 +89,13 @@ impl Args {
 
 const USAGE: &str = "usage: nmw-sim [--nodes 50] [--repeaters 15] [--loss 0.2] [--messages 300]
                [--interval 10] [--area 6000] [--range 2000] [--seed 1] [--seeds 5]
-               [--shared-contacts] [--min-delivery 0.95]
+               [--shared-contacts] [--group] [--min-delivery 0.95]
 
 Runs --seeds independent topologies (seeds seed..seed+seeds) and reports totals.
 --shared-contacts preloads every client's contacts (as if exchanged by QR code),
 so delivery does not depend on hearing announces.
+--group makes every client join one channel and post the messages there;
+delivery then counts (message, other client) pairs.
 --min-delivery gates on the share of all messages delivered. Messages to a
 destination the sender has not heard an announce from wait for a contact request.";
 
@@ -108,6 +116,8 @@ struct Stats {
     delivered: usize,
     acked: usize,
     duplicates: usize,
+    /// Group posts delivered without a verified sender.
+    unverified: usize,
     known_pairs: usize,
     pairs: usize,
     transmissions: usize,
@@ -128,6 +138,7 @@ impl Stats {
         self.delivered += o.delivered;
         self.acked += o.acked;
         self.duplicates += o.duplicates;
+        self.unverified += o.unverified;
         self.known_pairs += o.known_pairs;
         self.pairs += o.pairs;
         self.transmissions += o.transmissions;
@@ -184,6 +195,12 @@ fn simulate(args: &Args, seed: u64) -> Stats {
             }
         }
     }
+    let channel = Channel::public("#sim");
+    if args.group {
+        for node in &mut nodes[args.repeaters..] {
+            node.join_channel(&channel);
+        }
+    }
     let index: HashMap<Address, usize> = nodes
         .iter()
         .enumerate()
@@ -204,6 +221,8 @@ fn simulate(args: &Args, seed: u64) -> Stats {
     let end = TRAFFIC_START + interval * args.messages as u64 + 180 * S;
     let mut next_msg = 0usize;
     let mut sent: HashMap<(usize, usize, u16), Sent> = HashMap::new();
+    // Group mode: (message number, receiver) -> Sent, keyed by the text "msg N".
+    let mut group_sent: HashMap<(usize, usize), Sent> = HashMap::new();
     let mut st = Stats::default();
 
     let mut t = 0u64;
@@ -223,6 +242,25 @@ fn simulate(args: &Args, seed: u64) -> Stats {
         while next_msg < args.messages && TRAFFIC_START + interval * next_msg as u64 <= t {
             next_msg += 1;
             let src = rng.gen_range(args.repeaters..args.nodes);
+            if args.group {
+                let text = format!("msg {next_msg}");
+                nodes[src]
+                    .send_group(&channel, port::TEXT, text.as_bytes(), t)
+                    .expect("short text fits in one packet");
+                for dst in (args.repeaters..args.nodes).filter(|&d| d != src) {
+                    group_sent.insert(
+                        (next_msg, dst),
+                        Sent {
+                            at: t,
+                            hops: medium.topology.hops(src, dst, args.repeaters),
+                            known: true,
+                            delivered_at: None,
+                            acked: false,
+                        },
+                    );
+                }
+                continue;
+            }
             let mut dst = rng.gen_range(args.repeaters..args.nodes);
             while dst == src {
                 dst = rng.gen_range(args.repeaters..args.nodes);
@@ -264,6 +302,22 @@ fn simulate(args: &Args, seed: u64) -> Stats {
                             s.acked = true;
                         }
                     }
+                    Event::GroupMessage {
+                        data, from_addr, ..
+                    } => {
+                        let n = std::str::from_utf8(&data)
+                            .ok()
+                            .and_then(|t| t.strip_prefix("msg "))
+                            .and_then(|n| n.parse::<usize>().ok());
+                        if let Some(s) = n.and_then(|n| group_sent.get_mut(&(n, i))) {
+                            if s.delivered_at.is_some() {
+                                st.duplicates += 1;
+                            } else {
+                                s.delivered_at = Some(t);
+                                st.unverified += from_addr.is_none() as usize;
+                            }
+                        }
+                    }
                     Event::Failed { .. } | Event::Contact { .. } => {}
                 }
             }
@@ -287,8 +341,8 @@ fn simulate(args: &Args, seed: u64) -> Stats {
     }
 
     st.sim_time = end;
-    st.sent = sent.len();
-    for s in sent.values() {
+    st.sent = sent.len() + group_sent.len();
+    for s in sent.values().chain(group_sent.values()) {
         let e = st.by_hops.entry(s.hops).or_default();
         e.0 += 1;
         st.unknown += !s.known as usize;
@@ -351,6 +405,11 @@ fn main() -> ExitCode {
         args.interval_s,
         if args.shared_contacts { "shared" } else { "announce" }
     );
+    if args.group {
+        println!(
+            "  group mode: every client is in one channel; acknowledged and discovery do not apply"
+        );
+    }
 
     let mut total = Stats::default();
     for seed in args.seed..args.seed + args.seeds {
@@ -399,6 +458,12 @@ fn main() -> ExitCode {
         total.unknown,
         pct(total.unknown_delivered, total.unknown)
     );
+    if args.group {
+        println!(
+            "  sender verified     {:.1}% of delivered posts",
+            100.0 - pct(total.unverified, total.delivered)
+        );
+    }
     println!("  delivered by hops   {}", hops.join("  "));
     println!("  latency             p50 {p50:.2}s  p95 {p95:.2}s  max {max:.2}s");
     println!(

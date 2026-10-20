@@ -10,6 +10,7 @@
 extern crate alloc;
 
 pub mod airtime;
+pub mod channel;
 pub mod crypto;
 pub mod identity;
 pub mod node;
@@ -17,8 +18,9 @@ pub mod packet;
 mod rng;
 
 pub use airtime::LoraProfile;
+pub use channel::{Channel, ChannelId};
 pub use identity::{Address, Identity, PublicIdentity, ShortAddr};
-pub use node::{Event, Node, NodeConfig, Role, SendError, MAX_DATA};
+pub use node::{Event, Node, NodeConfig, Role, SendError, MAX_DATA, MAX_GROUP_DATA};
 pub use packet::{Packet, PacketType};
 
 /// Well-known service ports.

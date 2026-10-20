@@ -49,6 +49,13 @@ the address stays the same between runs. Try **Echo bot** (repeats what you
 send) and **Info bot** (`/help`, `/ping`, `/hops`, `/time`, `/nodes`). The
 **Radio log** button shows every frame your node sent or heard.
 
+Channels: the app joins **#public** on first run, where simulated users chat
+and Info bot answers commands. Join any `#name` to use a public channel
+(anyone who knows the name can read it). Type a name without `#` to create a
+private channel; **Copy invite key** gives others the key to join it.
+Every post is signed by its sender, so names in a channel can't be faked; a
+post whose sender the app can't check yet is marked unverified. Joined channels are saved in `channels.json` next to `identity.key`.
+
 ## Status
 
 M0 (protocol core + simulator) is done. The desktop app works against the simulated mesh; Heltec V4 firmware (M1) is next once hardware is available, and then the app switches to a real radio over USB.
