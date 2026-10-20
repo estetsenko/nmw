@@ -203,10 +203,10 @@ impl VirtualMesh {
                 "/help" => "Commands: /ping, /hops, /time, /nodes".into(),
                 "/ping" => "pong".into(),
                 "/hops" => match self.index.get(from) {
-                    Some(&i) => format!(
-                        "You are {} radio hops from me.",
-                        self.medium.topology.hops(i, bot_idx, self.repeaters)
-                    ),
+                    Some(&i) => match self.medium.topology.hops(i, bot_idx, self.repeaters) {
+                        1 => "You are 1 radio hop from me.".into(),
+                        n => format!("You are {n} radio hops from me."),
+                    },
                     None => "I don't know where you are.".into(),
                 },
                 "/time" => {

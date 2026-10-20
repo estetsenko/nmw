@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
-members = ["crates/nmw-core", "crates/nmw-sim", "crates/nmw-host"]
+members = ["crates/nmw-core", "crates/nmw-sim", "crates/nmw-host", "apps/desktop/src-tauri"]
+# The desktop app needs system WebView libraries; build it with `-p nmw-desktop`.
+default-members = ["crates/nmw-core", "crates/nmw-sim", "crates/nmw-host"]
 
 [workspace.package]
 edition = "2021"

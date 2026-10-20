@@ -194,6 +194,7 @@ The device is a **companion radio** (like MeshCore companions / Meshtastic clien
 - **v1 features:** contacts and 1:1 chat, channels, delivery receipts, node configuration (region, profile, role, name), live neighbour/route view, airtime and battery status, firmware update over USB.
 - **Doubles as dev tooling:** a packet log/inspector and a mode that drives the simulator instead of real hardware, so the same UI is used for protocol debugging.
 - **Bot hosting:** the desktop app can run bots locally against its attached radio, which makes it the easiest bot host for M4.
+- **Built so far (2026-10-20):** `apps/desktop` links `nmw-host`, whose `Mesh` trait is what the UI talks to. The only backend today is `VirtualMesh`: your node inside a simulated 20-node mesh (6 repeaters, 10% loss) with an Echo bot and an Info bot, run in real time on a background thread. The UI has contacts with live route length, 1:1 chat with delivery receipts and a 181-byte counter, opening a chat by address, a manual announce and the radio log. A serial backend for a real V4 slots in behind the same trait.
 
 ## 12. Bots
 
