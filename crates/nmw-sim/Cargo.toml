@@ -1,0 +1,12 @@
+[package]
+name = "nmw-sim"
+version = "0.1.0"
+description = "Deterministic multi-node simulator for the NMW mesh protocol"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+nmw-core = { path = "../nmw-core" }
+rand = { version = "0.8", features = ["small_rng"] }
