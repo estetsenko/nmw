@@ -36,7 +36,7 @@ NMW_SPEED=4 cargo run -p nmw-desktop  # 4x faster, handy for testing
 
 Installable packages (`.deb`, `.rpm` and `.AppImage` for Linux, a universal
 `.dmg` for macOS, `.msi` and an `.exe` installer for Windows) are built by the
-**Desktop packages** workflow on every push and PR; download them from the
+CI workflow on every push and PR, after the tests pass; download them from the
 run's artifacts. Pushing a `v*` tag also attaches them to a draft release.
 They are not code-signed yet, so macOS and Windows will warn on first launch.
 To build one locally: `cargo install tauri-cli --version '^2'`, then
