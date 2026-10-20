@@ -1,0 +1,77 @@
+name: Desktop packages
+
+# Builds installable desktop packages for Linux, macOS and Windows and
+# uploads them as workflow artifacts. A pushed `v*` tag also attaches them
+# to a draft GitHub release. Packages are not code-signed yet.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 22.04 keeps the glibc requirement low so the packages run on older distros.
+          - name: linux
+            os: ubuntu-22.04
+            args: ''
+            bundle: target/release/bundle
+          - name: macos
+            os: macos-latest
+            args: --target universal-apple-darwin
+            bundle: target/universal-apple-darwin/release/bundle
+          - name: windows
+            os: windows-latest
+            args: ''
+            bundle: target/release/bundle
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.name == 'macos' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: packages
+      - name: Install WebKitGTK and friends
+        if: matrix.name == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libssl-dev
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: tauri-cli@2
+      - name: Build packages
+        working-directory: apps/desktop/src-tauri
+        run: cargo tauri build ${{ matrix.args }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nmw-desktop-${{ matrix.name }}
+          if-no-files-found: error
+          path: |
+            ${{ matrix.bundle }}/deb/*.deb
+            ${{ matrix.bundle }}/rpm/*.rpm
+            ${{ matrix.bundle }}/appimage/*.AppImage
+            ${{ matrix.bundle }}/dmg/*.dmg
+            ${{ matrix.bundle }}/msi/*.msi
+            ${{ matrix.bundle }}/nsis/*.exe
+      - name: Attach to draft release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: |
+            ${{ matrix.bundle }}/deb/*.deb
+            ${{ matrix.bundle }}/rpm/*.rpm
+            ${{ matrix.bundle }}/appimage/*.AppImage
+            ${{ matrix.bundle }}/dmg/*.dmg
+            ${{ matrix.bundle }}/msi/*.msi
+            ${{ matrix.bundle }}/nsis/*.exe
