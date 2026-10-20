@@ -16,6 +16,7 @@ pub mod identity;
 pub mod node;
 pub mod packet;
 mod rng;
+pub mod text;
 
 pub use airtime::LoraProfile;
 pub use channel::{Channel, ChannelId};
@@ -34,4 +35,6 @@ pub mod port {
     pub const TELEMETRY: u16 = 7;
     pub const BOT: u16 = 8;
     pub const GATEWAY: u16 = 9;
+    /// One part of a long text, see [`crate::text`].
+    pub const TEXT_PART: u16 = 10;
 }

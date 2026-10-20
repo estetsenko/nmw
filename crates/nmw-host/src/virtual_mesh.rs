@@ -1,12 +1,13 @@
 //! This node plus a simulated mesh around it, with a couple of bots to talk to.
 
+use crate::long_text::{TextLayer, MAX_GROUP_TEXT, MAX_TEXT};
 use crate::{
     addr_to_hex, channel_id_to_hex, resolve_channel, ChannelInfo, ContactInfo, HostEvent, Mesh,
     RadioLogEntry, Status,
 };
 use nmw_core::{
     port, Address, Channel, Event, Identity, LoraProfile, Node, NodeConfig, Packet, PacketType,
-    Role, ShortAddr, MAX_DATA, MAX_GROUP_DATA,
+    Role, ShortAddr,
 };
 use nmw_sim::{Medium, RadioEvent, RxOutcome, Topology, TopologyParams, S};
 use rand::rngs::SmallRng;
@@ -77,6 +78,8 @@ enum Bot {
 
 pub struct VirtualMesh {
     nodes: Vec<Node>,
+    /// Long-message handling for each node.
+    layers: Vec<TextLayer>,
     names: Vec<String>,
     bots: Vec<Option<Bot>>,
     index: HashMap<Address, usize>,
@@ -199,6 +202,7 @@ impl VirtualMesh {
         let mut medium = Medium::new(topology, LoraProfile::MEDIUM, cfg.loss, rng.gen());
         medium.enable_log();
         VirtualMesh {
+            layers: (0..nodes.len()).map(|_| TextLayer::default()).collect(),
             nodes,
             names,
             bots,
@@ -273,7 +277,11 @@ impl VirtualMesh {
     fn handle_events(&mut self, t: u64) {
         for i in 0..self.nodes.len() {
             self.nodes[i].tick(t);
+            let mut evs = self.layers[i].expire(t);
             while let Some(ev) = self.nodes[i].poll_event() {
+                evs.extend(self.layers[i].filter(ev, t));
+            }
+            for ev in evs {
                 if i == self.me {
                     self.my_event(ev, t);
                 } else if let (
@@ -467,7 +475,7 @@ impl Mesh for VirtualMesh {
                 self.replies.drain(..).partition(|(at, ..)| *at <= t);
             self.replies = later;
             for (_, bot, to, text) in due {
-                let _ = self.nodes[bot].send(&to, port::TEXT, text.as_bytes(), t);
+                let _ = self.layers[bot].send_text(&mut self.nodes[bot], &to, &text, t);
             }
             let (due, later): (Vec<_>, Vec<_>) =
                 self.group_posts.drain(..).partition(|(at, ..)| *at <= t);
@@ -481,7 +489,7 @@ impl Mesh for VirtualMesh {
                 } else {
                     text
                 };
-                let _ = self.nodes[i].send_group(&self.public, port::TEXT, text.as_bytes(), t);
+                let _ = self.layers[i].send_group(&mut self.nodes[i], &self.public, &text, t);
             }
             self.handle_events(t);
             self.medium.transmit(&mut self.nodes, t);
@@ -497,6 +505,9 @@ impl Mesh for VirtualMesh {
             for (at, ..) in &self.group_posts {
                 next = next.min(*at);
             }
+            for d in self.layers.iter().filter_map(TextLayer::next_deadline) {
+                next = next.min(d);
+            }
             if next > target {
                 self.t = self.t.max(target);
                 return;
@@ -510,17 +521,18 @@ impl Mesh for VirtualMesh {
     }
 
     fn send_text(&mut self, to: &Address, text: &str) -> Result<u16, String> {
-        if text.len() > MAX_DATA {
+        if text.len() > MAX_TEXT {
             return Err(format!(
-                "message is {} bytes; the limit is {MAX_DATA}",
+                "message is {} bytes; the limit is {MAX_TEXT}",
                 text.len()
             ));
         }
         if *to == self.address() {
             return Err("that is this node's own address".into());
         }
-        self.nodes[self.me]
-            .send(to, port::TEXT, text.as_bytes(), self.t)
+        let me = self.me;
+        self.layers[me]
+            .send_text(&mut self.nodes[me], to, text, self.t)
             .map_err(|e| format!("{e:?}"))
     }
 
@@ -586,9 +598,9 @@ impl Mesh for VirtualMesh {
     }
 
     fn send_group(&mut self, id: &str, text: &str) -> Result<(), String> {
-        if text.len() > MAX_GROUP_DATA {
+        if text.len() > MAX_GROUP_TEXT {
             return Err(format!(
-                "message is {} bytes; the limit is {MAX_GROUP_DATA}",
+                "message is {} bytes; the limit is {MAX_GROUP_TEXT}",
                 text.len()
             ));
         }
@@ -598,8 +610,9 @@ impl Mesh for VirtualMesh {
             .find(|c| c.id == id)
             .and_then(ChannelInfo::channel)
             .ok_or("not a joined channel")?;
-        self.nodes[self.me]
-            .send_group(&channel, port::TEXT, text.as_bytes(), self.t)
+        let me = self.me;
+        self.layers[me]
+            .send_group(&mut self.nodes[me], &channel, text, self.t)
             .map_err(|e| format!("{e:?}"))
     }
 }
@@ -745,7 +758,38 @@ mod tests {
         m.advance_to(m.now() + 20 * 60 * S);
         assert_eq!(group_texts(&m.drain_events()), vec![]);
         assert!(m
-            .send_group(&team.id, &"x".repeat(MAX_GROUP_DATA + 1))
+            .send_group(&team.id, &"x".repeat(MAX_GROUP_TEXT + 1))
+            .is_err());
+    }
+
+    #[test]
+    fn long_messages_arrive_whole() {
+        let mut m = ready_mesh();
+        let echo = contact(&m, ECHO_BOT);
+        let long = "The quick brown fox jumps over the lazy dog. ".repeat(10);
+        assert!(long.len() > nmw_core::MAX_DATA);
+        m.drain_events();
+        let seq = m.send_text(&echo, &long).unwrap();
+        m.advance_to(m.now() + 120 * S);
+        let ev = m.drain_events();
+        let delivered: Vec<_> = ev
+            .iter()
+            .filter(|e| matches!(e, HostEvent::Delivered { .. }))
+            .collect();
+        assert_eq!(
+            delivered,
+            vec![&HostEvent::Delivered {
+                to: addr_to_hex(&echo),
+                seq
+            }],
+            "one receipt for the whole message"
+        );
+        assert_eq!(texts(&ev), vec![format!("echo: {long}")]);
+
+        let public = m.join_channel(PUBLIC_CHANNEL, None).unwrap();
+        m.send_group(&public.id, &long).unwrap();
+        assert!(m
+            .send_group(&public.id, &"x".repeat(MAX_GROUP_TEXT + 1))
             .is_err());
     }
 
@@ -755,7 +799,7 @@ mod tests {
         let me = m.address();
         assert!(m.send_text(&me, "hi").is_err());
         let echo = Address([7; 16]);
-        assert!(m.send_text(&echo, &"x".repeat(MAX_DATA + 1)).is_err());
+        assert!(m.send_text(&echo, &"x".repeat(MAX_TEXT + 1)).is_err());
     }
 
     #[test]

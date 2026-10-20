@@ -56,6 +56,10 @@ private channel; **Copy invite key** gives others the key to join it.
 Every post is signed by its sender, so names in a channel can't be faked; a
 post whose sender the app can't check yet is marked unverified. Joined channels are saved in `channels.json` next to `identity.key`.
 
+Long messages are sent as up to 16 packets and shown whole on the other side,
+so a message can be up to 2832 bytes (2352 in a channel); the byte counter
+shows how many parts it will take.
+
 ## Status
 
 M0 (protocol core + simulator) is done. The desktop app works against the simulated mesh; Heltec V4 firmware (M1) is next once hardware is available, and then the app switches to a real radio over USB.
