@@ -6,8 +6,14 @@
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 
-const MAX_TEXT = 181; // MAX_DATA in nmw-core
-const MAX_GROUP_TEXT = 151; // MAX_GROUP_DATA in nmw-core
+// One packet carries MAX_DATA (MAX_GROUP_DATA in a channel) bytes; longer
+// text goes as up to 16 parts with a 4-byte header each (nmw-core text.rs).
+const MAX_DATA = 181;
+const MAX_GROUP_DATA = 151;
+const PART_HEADER = 4;
+const MAX_PARTS = 16;
+const MAX_TEXT = MAX_PARTS * (MAX_DATA - PART_HEADER);
+const MAX_GROUP_TEXT = MAX_PARTS * (MAX_GROUP_DATA - PART_HEADER);
 const LOG_LIMIT = 300;
 const $ = (id) => document.getElementById(id);
 
@@ -72,6 +78,25 @@ function selectedChannel() {
 
 function maxText() {
   return isChannel(state.selected) ? MAX_GROUP_TEXT : MAX_TEXT;
+}
+
+// Number of packets `text` goes out as, cutting at character boundaries the
+// way nmw-core's text::split does.
+function partCount(text) {
+  const single = isChannel(state.selected) ? MAX_GROUP_DATA : MAX_DATA;
+  if (encoder.encode(text).length <= single) return 1;
+  const room = single - PART_HEADER;
+  let parts = 1;
+  let used = 0;
+  for (const ch of text) {
+    const n = encoder.encode(ch).length;
+    if (used + n > room) {
+      parts += 1;
+      used = 0;
+    }
+    used += n;
+  }
+  return parts;
 }
 
 // ---- sidebar ----
@@ -214,7 +239,8 @@ function updateBytes() {
   const n = encoder.encode($('text').value).length;
   const max = maxText();
   const b = $('bytes');
-  b.textContent = `${n}/${max} bytes`;
+  const parts = n > max ? 0 : partCount($('text').value);
+  b.textContent = parts > 1 ? `${n}/${max} bytes · ${parts} parts` : `${n}/${max} bytes`;
   b.classList.toggle('over', n > max);
   $('send').disabled = n === 0 || n > max;
 }

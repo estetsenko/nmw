@@ -5,9 +5,11 @@
 //! serial/BLE link to a real radio. [`Runtime`] drives a mesh in real time
 //! on a background thread and hands [`HostEvent`]s to a callback.
 
+mod long_text;
 mod runtime;
 mod virtual_mesh;
 
+pub use long_text::{TextLayer, MAX_GROUP_TEXT, MAX_TEXT};
 pub use runtime::Runtime;
 pub use virtual_mesh::{VirtualMesh, VirtualMeshConfig, PUBLIC_CHANNEL};
 
