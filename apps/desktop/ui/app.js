@@ -107,13 +107,34 @@ function upsertContact(c) {
   state.contacts.set(c.addr, { ...prev, ...c });
 }
 
-function listItem(key, avatarText, avatarHue, name, sub, extraCls) {
+// Line icons for channel avatars: a globe for public, a padlock for private.
+const ICONS = {
+  public: ['M12 3a9 9 0 1 0 0 18a9 9 0 1 0 0-18', 'M3 12h18', 'M12 3c3 3.2 3 14.8 0 18', 'M12 3c-3 3.2-3 14.8 0 18'],
+  private: ['M6 11h12v9H6z', 'M8.5 11V8a3.5 3.5 0 0 1 7 0v3'],
+};
+
+function icon(name) {
+  const ns = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(ns, 'svg');
+  svg.setAttribute('viewBox', '0 0 24 24');
+  svg.setAttribute('aria-hidden', 'true');
+  for (const d of ICONS[name]) {
+    const path = document.createElementNS(ns, 'path');
+    path.setAttribute('d', d);
+    svg.append(path);
+  }
+  return svg;
+}
+
+// `avatar` is the text to show, or a node such as an icon.
+function listItem(key, avatar, avatarHue, name, sub, extraCls) {
   const li = el('li', 'contact' + (key === state.selected ? ' selected' : ''));
   li.dataset.key = key;
   li.tabIndex = 0;
-  const avatar = el('span', 'avatar' + (extraCls ? ` ${extraCls}` : ''), avatarText);
-  avatar.style.background = `hsl(${avatarHue} 45% 42%)`;
-  li.append(avatar);
+  const avatarEl = el('span', 'avatar' + (extraCls ? ` ${extraCls}` : ''), typeof avatar === 'string' ? avatar : '');
+  if (typeof avatar !== 'string') avatarEl.append(avatar);
+  avatarEl.style.background = `hsl(${avatarHue} 45% 42%)`;
+  li.append(avatarEl);
   const info = el('div', 'info');
   info.append(el('div', 'name', name));
   info.append(el('div', 'sub', sub));
@@ -133,7 +154,8 @@ function renderSidebar() {
   const chans = [...state.channels.values()].sort((a, b) => a.name.localeCompare(b.name));
   for (const c of chans) {
     const sub = c.public ? 'Public channel' : 'Private channel';
-    channels.append(listItem(`g:${c.id}`, '#', hue(c.id), c.name, sub, 'channel'));
+    const kind = c.public ? 'public' : 'private';
+    channels.append(listItem(`g:${c.id}`, icon(kind), hue(c.id), c.name, sub, 'channel'));
   }
 
   const contacts = $('contacts');
