@@ -34,6 +34,14 @@ cargo run -p nmw-desktop            # mesh time runs at real speed
 NMW_SPEED=4 cargo run -p nmw-desktop  # 4x faster, handy for testing
 ```
 
+Installable packages (`.deb`, `.rpm` and `.AppImage` for Linux, a universal
+`.dmg` for macOS, `.msi` and an `.exe` installer for Windows) are built by the
+**Desktop packages** workflow on every push and PR; download them from the
+run's artifacts. Pushing a `v*` tag also attaches them to a draft release.
+They are not code-signed yet, so macOS and Windows will warn on first launch.
+To build one locally: `cargo install tauri-cli --version '^2'`, then
+`cargo tauri build` in `apps/desktop/src-tauri`.
+
 Your node's identity is kept in `identity.key` in the app data directory, so
 the address stays the same between runs. Try **Echo bot** (repeats what you
 send) and **Info bot** (`/help`, `/ping`, `/hops`, `/time`, `/nodes`). The
