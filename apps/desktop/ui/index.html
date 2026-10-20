@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NMW</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <svg class="mark" viewBox="0 0 32 32" aria-hidden="true">
+        <rect width="32" height="32" rx="7"/>
+        <path d="M9 10 L23 8 L16 17 Z M16 17 L8 24 L24 23 Z M23 8 L24 23"/>
+        <circle cx="9" cy="10" r="2.2"/><circle cx="23" cy="8" r="2.2"/><circle cx="16" cy="17" r="2.6"/>
+        <circle cx="8" cy="24" r="2.2"/><circle cx="24" cy="23" r="2.2"/>
+      </svg>
+      <span>NMW</span>
+    </div>
+    <div class="me">
+      <span id="me-name">Starting…</span>
+      <button id="copy-addr" class="addr-chip" title="Copy full address"></button>
+    </div>
+    <div class="stats">
+      <span id="backend" class="badge"></span>
+      <span class="stat"><span class="label">Airtime</span> <span id="airtime">0%</span></span>
+      <span class="stat"><span class="label">Mesh time</span> <span id="clock">00:00:00</span></span>
+      <button id="announce" class="ghost">Announce</button>
+      <button id="toggle-log" class="ghost" aria-pressed="false">Radio log</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <aside class="sidebar">
+      <form id="new-chat" class="new-chat">
+        <input id="new-addr" placeholder="Message an address (32 hex characters)" autocomplete="off" spellcheck="false">
+        <button type="submit">Open</button>
+      </form>
+      <p id="new-chat-error" class="error" hidden></p>
+      <h2>Contacts <span id="contact-count" class="count"></span></h2>
+      <ul id="contacts" class="contacts"></ul>
+      <p id="contacts-empty" class="empty">Listening for announces…</p>
+    </aside>
+
+    <section class="chat" id="chat">
+      <div class="chat-empty" id="chat-empty">
+        <h1>No chat selected</h1>
+        <p>Pick a contact on the left. In the simulated mesh, <b>Echo bot</b> repeats what you send and <b>Info bot</b> answers <code>/help</code>.</p>
+      </div>
+      <div class="chat-main" id="chat-main" hidden>
+        <div class="chat-head">
+          <div>
+            <h1 id="chat-name"></h1>
+            <code id="chat-addr" class="full-addr"></code>
+          </div>
+          <span id="chat-route" class="route"></span>
+        </div>
+        <ol id="messages" class="messages"></ol>
+        <form id="composer" class="composer">
+          <textarea id="text" rows="2" placeholder="Write a message. Enter sends, Shift+Enter adds a line."></textarea>
+          <div class="composer-side">
+            <span id="bytes" class="bytes"></span>
+            <button type="submit" id="send">Send</button>
+          </div>
+        </form>
+        <p id="send-error" class="error" hidden></p>
+      </div>
+    </section>
+
+    <aside class="radio" id="radio" hidden>
+      <h2>Radio log <span class="hint">frames this node sent or heard</span></h2>
+      <div class="log-wrap">
+        <table class="log">
+          <thead><tr><th>Time</th><th></th><th>Peer</th><th>Type</th><th>Bytes</th><th>Path</th><th>Signal</th><th>Result</th></tr></thead>
+          <tbody id="log"></tbody>
+        </table>
+      </div>
+    </aside>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>

@@ -17,10 +17,29 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test --all
+      # The desktop app has its own job (it needs WebKitGTK); the default
+      # workspace members are the protocol crates.
+      - run: cargo test
       - name: nmw-core builds without std
         run: cargo build -p nmw-core --target thumbv7em-none-eabihf
       - name: Simulator gate, contacts shared by QR (M0 exit criterion)
         run: cargo run --release -p nmw-sim -- --seeds 20 --shared-contacts --loss 0.2 --min-delivery 0.95
       - name: Simulator gate, contacts from announces and contact requests
         run: cargo run --release -p nmw-sim -- --seeds 20 --loss 0.2 --min-delivery 0.95
+
+  desktop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install WebKitGTK and friends
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libssl-dev
+      - run: cargo clippy -p nmw-desktop -- -D warnings
+      - run: cargo build -p nmw-desktop
+      - name: UI script parses
+        run: node --check apps/desktop/ui/app.js
