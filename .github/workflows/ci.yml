@@ -20,5 +20,7 @@ jobs:
       - run: cargo test --all
       - name: nmw-core builds without std
         run: cargo build -p nmw-core --target thumbv7em-none-eabihf
-      - name: Simulator gate (M0 exit criterion)
+      - name: Simulator gate, contacts shared by QR (M0 exit criterion)
         run: cargo run --release -p nmw-sim -- --seeds 20 --shared-contacts --loss 0.2 --min-delivery 0.95
+      - name: Simulator gate, contacts from announces and contact requests
+        run: cargo run --release -p nmw-sim -- --seeds 20 --loss 0.2 --min-delivery 0.95
