@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/nmw-core", "crates/nmw-sim"]
+members = ["crates/nmw-core", "crates/nmw-sim", "crates/nmw-host"]
 
 [workspace.package]
 edition = "2021"

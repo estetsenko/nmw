@@ -136,6 +136,7 @@ pub enum RadioEvent {
         to: usize,
         snr_db: f32,
         outcome: RxOutcome,
+        frame: Vec<u8>,
     },
 }
 
@@ -237,6 +238,7 @@ impl Medium {
                         to: r,
                         snr_db: snr,
                         outcome,
+                        frame: tx.frame.clone(),
                     });
                 }
             }

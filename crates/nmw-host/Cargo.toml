@@ -1,0 +1,13 @@
+[package]
+name = "nmw-host"
+version = "0.1.0"
+description = "Host-side NMW runtime for desktop apps, bots and gateways: a real-time node with a pluggable radio backend"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+nmw-core = { path = "../nmw-core" }
+nmw-sim = { path = "../nmw-sim" }
+rand = { version = "0.8", features = ["small_rng"] }
+serde = { version = "1", features = ["derive"] }
