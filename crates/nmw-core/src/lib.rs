@@ -12,6 +12,7 @@ extern crate alloc;
 pub mod airtime;
 pub mod channel;
 pub mod crypto;
+pub mod file;
 pub mod identity;
 pub mod node;
 pub mod packet;

@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+base64 = "0.22"
 nmw-core = { path = "../nmw-core" }
 nmw-sim = { path = "../nmw-sim" }
 rand = { version = "0.8", features = ["small_rng"] }

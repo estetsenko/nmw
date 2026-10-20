@@ -1,5 +1,6 @@
 //! This node plus a simulated mesh around it, with a couple of bots to talk to.
 
+use crate::files::{FileEvent, FileLayer, MAX_FILE};
 use crate::long_text::{TextLayer, MAX_GROUP_TEXT, MAX_TEXT};
 use crate::{
     addr_to_hex, channel_id_to_hex, resolve_channel, ChannelInfo, ContactInfo, HostEvent, Mesh,
@@ -80,6 +81,8 @@ pub struct VirtualMesh {
     nodes: Vec<Node>,
     /// Long-message handling for each node.
     layers: Vec<TextLayer>,
+    /// File transfers for each node.
+    files: Vec<FileLayer>,
     names: Vec<String>,
     bots: Vec<Option<Bot>>,
     index: HashMap<Address, usize>,
@@ -91,6 +94,8 @@ pub struct VirtualMesh {
     announces: Vec<Vec<u64>>,
     /// (when, bot node, recipient, text)
     replies: Vec<(u64, usize, Address, String)>,
+    /// Files Echo bot sends back: (when, bot node, recipient, name, mime, data).
+    file_replies: Vec<(u64, usize, Address, String, String, Vec<u8>)>,
     /// (when, node, text) posts to the public channel by simulated nodes.
     group_posts: Vec<(u64, usize, String)>,
     public: Channel,
@@ -203,6 +208,7 @@ impl VirtualMesh {
         medium.enable_log();
         VirtualMesh {
             layers: (0..nodes.len()).map(|_| TextLayer::default()).collect(),
+            files: (0..nodes.len()).map(|_| FileLayer::default()).collect(),
             nodes,
             names,
             bots,
@@ -213,6 +219,7 @@ impl VirtualMesh {
             t: 0,
             announces,
             replies: Vec::new(),
+            file_replies: Vec::new(),
             group_posts,
             public,
             my_channels: Vec::new(),
@@ -278,8 +285,29 @@ impl VirtualMesh {
         for i in 0..self.nodes.len() {
             self.nodes[i].tick(t);
             let mut evs = self.layers[i].expire(t);
+            self.files[i].expire(t);
             while let Some(ev) = self.nodes[i].poll_event() {
-                evs.extend(self.layers[i].filter(ev, t));
+                if let Some(ev) = self.files[i].filter(&mut self.nodes[i], ev, t) {
+                    evs.extend(self.layers[i].filter(ev, t));
+                }
+            }
+            for fev in self.files[i].take_events() {
+                if i == self.me {
+                    self.events.push(HostEvent::from_file(fev, t / 1000));
+                } else if let (
+                    Some(Bot::Echo),
+                    FileEvent::Received {
+                        from,
+                        name,
+                        mime,
+                        data,
+                        ..
+                    },
+                ) = (self.bots[i], fev)
+                {
+                    let at = t + self.rng.gen_range(BOT_DELAY);
+                    self.file_replies.push((at, i, from, name, mime, data));
+                }
             }
             for ev in evs {
                 if i == self.me {
@@ -478,6 +506,12 @@ impl Mesh for VirtualMesh {
                 let _ = self.layers[bot].send_text(&mut self.nodes[bot], &to, &text, t);
             }
             let (due, later): (Vec<_>, Vec<_>) =
+                self.file_replies.drain(..).partition(|(at, ..)| *at <= t);
+            self.file_replies = later;
+            for (_, bot, to, name, mime, data) in due {
+                let _ = self.files[bot].send_file(&mut self.nodes[bot], &to, &name, &mime, data, t);
+            }
+            let (due, later): (Vec<_>, Vec<_>) =
                 self.group_posts.drain(..).partition(|(at, ..)| *at <= t);
             self.group_posts = later;
             for (_, i, text) in due {
@@ -502,10 +536,16 @@ impl Mesh for VirtualMesh {
             for (at, ..) in &self.replies {
                 next = next.min(*at);
             }
+            for (at, ..) in &self.file_replies {
+                next = next.min(*at);
+            }
             for (at, ..) in &self.group_posts {
                 next = next.min(*at);
             }
             for d in self.layers.iter().filter_map(TextLayer::next_deadline) {
+                next = next.min(d);
+            }
+            for d in self.files.iter().filter_map(FileLayer::next_deadline) {
                 next = next.min(d);
             }
             if next > target {
@@ -613,6 +653,31 @@ impl Mesh for VirtualMesh {
         let me = self.me;
         self.layers[me]
             .send_group(&mut self.nodes[me], &channel, text, self.t)
+            .map_err(|e| format!("{e:?}"))
+    }
+
+    fn send_file(
+        &mut self,
+        to: &Address,
+        name: &str,
+        mime: &str,
+        data: Vec<u8>,
+    ) -> Result<u16, String> {
+        if data.is_empty() {
+            return Err("the file is empty".into());
+        }
+        if data.len() > MAX_FILE {
+            return Err(format!(
+                "the file is {} bytes; the limit is {MAX_FILE}",
+                data.len()
+            ));
+        }
+        if *to == self.address() {
+            return Err("that is this node's own address".into());
+        }
+        let me = self.me;
+        self.files[me]
+            .send_file(&mut self.nodes[me], to, name, mime, data, self.t)
             .map_err(|e| format!("{e:?}"))
     }
 }
@@ -791,6 +856,47 @@ mod tests {
         assert!(m
             .send_group(&public.id, &"x".repeat(MAX_GROUP_TEXT + 1))
             .is_err());
+    }
+
+    #[test]
+    fn echo_bot_sends_a_file_back() {
+        let mut m = ready_mesh();
+        let echo = contact(&m, ECHO_BOT);
+        let data: Vec<u8> = (0..6000u32).map(|i| (i * 31 % 256) as u8).collect();
+        m.drain_events();
+        let id = m
+            .send_file(&echo, "photo.jpg", "image/jpeg", data.clone())
+            .unwrap();
+        m.advance_to(m.now() + 15 * 60 * S);
+        let ev = m.drain_events();
+        let e = addr_to_hex(&echo);
+        assert!(
+            ev.contains(&HostEvent::FileSent { to: e.clone(), id }),
+            "{ev:?}"
+        );
+        let got: Vec<_> = ev
+            .iter()
+            .filter_map(|e| match e {
+                HostEvent::FileReceived {
+                    from, name, data, ..
+                } => Some((from.clone(), name.clone(), data.clone())),
+                _ => None,
+            })
+            .collect();
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+        assert_eq!(got, vec![(e.clone(), "photo.jpg".to_string(), b64)]);
+        assert!(ev
+            .iter()
+            .any(|e| matches!(e, HostEvent::FileOffered { size: 6000, .. })));
+        assert!(ev
+            .iter()
+            .any(|e| matches!(e, HostEvent::FileProgress { outgoing: true, .. })));
+        assert!(!ev.iter().any(|e| matches!(e, HostEvent::FileFailed { .. })));
+        assert!(m
+            .send_file(&echo, "big", "", vec![0; MAX_FILE + 1])
+            .is_err());
+        assert!(m.send_file(&echo, "empty", "", vec![]).is_err());
     }
 
     #[test]

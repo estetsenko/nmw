@@ -246,6 +246,19 @@ button.small { padding: 4px 10px; font-size: 12.5px; }
 .bytes { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
 .bytes.over { color: var(--bad); }
 #send-error { margin: 0 20px 10px; }
+.attach { align-self: flex-start; padding: 8px; line-height: 0; }
+.attach svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.msg .bubble.file { padding: 6px; white-space: normal; }
+.msg .photo { display: block; max-width: 280px; max-height: 280px; border-radius: 10px; }
+.file-card { display: flex; align-items: center; gap: 10px; padding: 4px 6px; }
+.file-card svg { width: 26px; height: 26px; flex-shrink: 0; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.file-card .file-name { font-weight: 600; word-break: break-all; }
+.file-card .file-size { font-size: 12px; opacity: .75; }
+.progress { height: 4px; border-radius: 2px; background: var(--line); margin: 6px 6px 2px; overflow: hidden; }
+.progress > div { height: 100%; background: var(--accent); }
+.msg.out .progress { background: rgba(255, 255, 255, .3); }
+.msg.out .progress > div { background: var(--out-text); }
+.msg .save { margin: 6px 6px 2px; }
 
 .radio {
   width: 520px;

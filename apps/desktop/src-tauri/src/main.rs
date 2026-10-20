@@ -4,6 +4,8 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine;
 use nmw_host::{
     parse_addr, ChannelInfo, ContactInfo, Mesh, Runtime, Status, VirtualMesh, VirtualMeshConfig,
 };
@@ -73,6 +75,65 @@ fn send_group(state: State<AppState>, id: String, text: String) -> Result<(), St
 fn send_text(state: State<AppState>, to: String, text: String) -> Result<u16, String> {
     let to = parse_addr(&to).ok_or("not a valid address (32 hex characters)")?;
     state.runtime.with(|m| m.send_text(&to, &text))
+}
+
+#[tauri::command]
+fn send_file(
+    state: State<AppState>,
+    to: String,
+    name: String,
+    mime: String,
+    data: String,
+) -> Result<u16, String> {
+    let to = parse_addr(&to).ok_or("not a valid address (32 hex characters)")?;
+    let data = B64
+        .decode(data)
+        .map_err(|e| format!("bad file data: {e}"))?;
+    state.runtime.with(|m| m.send_file(&to, &name, &mime, data))
+}
+
+/// Save a received file in the Downloads folder under a name not taken yet.
+/// Returns the path it was saved to.
+#[tauri::command]
+fn save_file(app: tauri::AppHandle, name: String, data: String) -> Result<String, String> {
+    let data = B64
+        .decode(data)
+        .map_err(|e| format!("bad file data: {e}"))?;
+    let dir = app.path().download_dir().map_err(|e| e.to_string())?;
+    let path = free_path(&dir, &safe_file_name(&name));
+    std::fs::write(&path, data).map_err(|e| format!("could not save {}: {e}", path.display()))?;
+    Ok(path.display().to_string())
+}
+
+/// The sender picks the name, so keep only its last path component.
+fn safe_file_name(name: &str) -> String {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or("");
+    let clean: String = base
+        .chars()
+        .filter(|c| !c.is_control() && !matches!(c, ':' | '*' | '?' | '"' | '<' | '>' | '|'))
+        .collect();
+    let clean = clean.trim().trim_start_matches('.');
+    if clean.is_empty() {
+        "file".into()
+    } else {
+        clean.into()
+    }
+}
+
+/// `dir/name`, or `dir/stem (2).ext` and so on if that exists.
+fn free_path(dir: &Path, name: &str) -> PathBuf {
+    let path = dir.join(name);
+    if !path.exists() {
+        return path;
+    }
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() => (s, format!(".{e}")),
+        _ => (name, String::new()),
+    };
+    (2..)
+        .map(|n| dir.join(format!("{stem} ({n}){ext}")))
+        .find(|p| !p.exists())
+        .expect("some name is free")
 }
 
 #[tauri::command]
@@ -146,8 +207,38 @@ fn main() {
             announce,
             join_channel,
             leave_channel,
-            send_group
+            send_group,
+            send_file,
+            save_file
         ])
         .run(tauri::generate_context!())
         .expect("error while running the NMW desktop app");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn received_file_names_stay_in_the_folder() {
+        assert_eq!(safe_file_name("photo.jpg"), "photo.jpg");
+        assert_eq!(safe_file_name("../../etc/passwd"), "passwd");
+        assert_eq!(safe_file_name("C:\\x\\evil.exe"), "evil.exe");
+        assert_eq!(safe_file_name(".bashrc"), "bashrc");
+        assert_eq!(safe_file_name(""), "file");
+        assert_eq!(safe_file_name("a/"), "file");
+        assert_eq!(safe_file_name("we<i>rd?.txt"), "weird.txt");
+    }
+
+    #[test]
+    fn free_path_adds_a_number() {
+        let dir = std::env::temp_dir().join(format!("nmw-free-path-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(free_path(&dir, "a.txt"), dir.join("a.txt"));
+        std::fs::write(dir.join("a.txt"), "x").unwrap();
+        assert_eq!(free_path(&dir, "a.txt"), dir.join("a (2).txt"));
+        std::fs::write(dir.join("noext"), "x").unwrap();
+        assert_eq!(free_path(&dir, "noext"), dir.join("noext (2)"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

@@ -60,6 +60,11 @@ Long messages are sent as up to 16 packets and shown whole on the other side,
 so a message can be up to 2832 bytes (2352 in a channel); the byte counter
 shows how many parts it will take.
 
+The paperclip button sends a photo or file (up to 32 KB) to a contact. Photos
+are shrunk to about 12 KB first, since each kilobyte takes roughly 10 seconds
+per radio hop. Echo bot sends files back, and received files can be saved to
+the Downloads folder.
+
 ## Status
 
 M0 (protocol core + simulator) is done. The desktop app works against the simulated mesh; Heltec V4 firmware (M1) is next once hardware is available, and then the app switches to a real radio over USB.
