@@ -150,6 +150,7 @@ code, .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; 
 .chat-side { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
 button.small { padding: 4px 10px; font-size: 12.5px; }
 .full-addr.desc { font-family: inherit; font-size: 12.5px; white-space: normal; user-select: auto; }
+.msg .sender.unverified { color: var(--warn); }
 .msg .sender { font-size: 12px; font-weight: 600; margin: 0 4px 2px; }
 .contact {
   display: flex;

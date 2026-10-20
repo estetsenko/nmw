@@ -91,10 +91,10 @@ Byte   Field
 
 - **packet_id is 32-bit** (not 16) because it forms the AEAD nonce with `src`; a 16-bit counter would wrap within days on a busy node. Firmware persists the counter (or restarts it from a random value) across reboots.
 - **AAD** = version, type, routed, ack_req, packet_id, dst, src. The hop counters and path are excluded because repeaters change them.
-- **Types:** `DATA` (0), `ACK` (1), `ANNOUNCE` (2, flooded, or source-routed when answering a contact request), `GROUP` (3, flooded to a channel id, not acknowledged), `CTRL` (4: subtype 1 = contact request), `DATA_KEY` (5: DATA prefixed with the sender's 32-byte public key).
+- **Types:** `DATA` (0), `ACK` (1), `ANNOUNCE` (2, flooded, or source-routed when answering a contact request), `GROUP` (3, flooded to a channel id, not acknowledged), `CTRL` (4: subtype 1 = contact request, 2 = whois by short address), `DATA_KEY` (5: DATA prefixed with the sender's 32-byte public key).
 - **Payloads:**
   - `DATA`: AEAD(`seq(2) | port(2) | data`) + 8-byte tag. `seq` is the end-to-end message number used for ACKs and duplicate suppression; every (re)transmission gets a fresh packet_id. Max application data: 181 bytes.
-  - `GROUP`: AEAD under the channel key of `port(2) | name_len(1) | name | data`. The sender name is unverified: anyone with the key can post as anyone. Max application data: 182 bytes.
+  - `GROUP`: AEAD under the channel key of `port(2) | sig(64) | data`, where `sig` is the sender's Ed25519 signature over `"nmwG" | channel_id | src | packet_id | port | data`. Receivers verify it against the sender's key from their signed announce and show the announced name, so a member cannot post as someone else. A post from a sender whose announce we lack is held for up to 20 s while we flood a whois (`CTRL` subtype 2, `dst` = sender's short address; the owner answers with a flooded announce, at most once a minute, and members that overhear a whois don't send their own). If no announce arrives the post is shown marked unverified. Max application data: 151 bytes.
   - `ACK`: AEAD(`seq(2) | has_fwd_path(1) | fwd_path`). When the DATA arrived by flood, the ACK carries the path it took so the sender learns the route.
   - `ANNOUNCE`: `pubkey(32) | role(1) | name_len(1) | name(≤32) | sig(64)`, signed over `"nmwA" | packet_id | body`. About 130 bytes.
 - **Fragmentation** lives in transport (resource packets carry `resource_id(2) | frag_idx(1) | frag_count(1)`), not in the base header.
@@ -120,7 +120,7 @@ Hybrid of managed flooding and learned source routes. The two existing approache
 
 - **Primitives:** X25519, Ed25519, HKDF-SHA256, ChaCha20-Poly1305 (fast in software on both MCUs; AES-CCM would use the nRF52 hardware block but adds a second code path, so not in v1).
 - **1:1:** static-static ECDH → HKDF → per-pair key; nonce = `src | packet_id | type`. Cheap, zero handshake airtime. Optional **session ratchet** (a Noise IK handshake, ~2 packets) for forward secrecy when both peers are online and the link is good.
-- **Groups/channels:** symmetric channel key shared by QR/link; optional per-message Ed25519 signature (+64 bytes) for "who really sent this" in large or public channels, off by default.
+- **Groups/channels:** symmetric channel key shared by QR/link (or derived from a public `#name`); every post carries the sender's Ed25519 signature (+64 bytes), so the key only grants reading and posting, not impersonation.
 - **Announces** are signed; repeaters verify before re-flooding (cuts spoofed-announce floods).
 - **Truncated tag:** 8-byte Poly1305 tag on air. Acceptable for this threat model; packets with failed tags are dropped silently.
 - **Headers are not encrypted** (repeaters need dst/path). This leaks who talks to whom to local listeners; documented as a known limitation.
@@ -272,13 +272,13 @@ At 0% loss every failure is a pair more than 7 radio hops apart, beyond the 6-re
 
 **Group channels** (`nmw-sim --group`: all 35 clients in one channel, 300 posts; delivery counts post × other member pairs):
 
-| Per-link loss | Delivered | p95 latency |
-|---|---|---|
-| 0% | 99.4% | 2.2 s |
-| 20% | 95.6% | 2.9 s |
-| 30% | 91.3% | 3.3 s |
+| Per-link loss | Delivered | Sender verified | p95 latency |
+|---|---|---|---|
+| 0% | 99.4% | 98.9% | 4.2 s |
+| 20% | 95.1% | 97.5% | 6.2 s |
+| 30% | 91.3% | 93.4% | 23 s |
 
-Group posts have no end-to-end ACK, so whoever sends or rebroadcasts one listens for a repeater further out passing it on and sends it once more if none does (`FLOOD_ECHO_RETRIES = 1`), and a pending rebroadcast is only cancelled after hearing 3 copies (`group_redundancy`). Together these lifted delivery at 20% loss from 87.3% to 95.6%, at the cost of the busiest node's airtime rising from 1.9% to 2.9% under this heavy load. A second echo retry would add only 0.6 points for another 1.1 points of airtime.
+Group posts have no end-to-end ACK, so whoever sends or rebroadcasts one listens for a repeater further out passing it on and sends it once more if none does (`FLOOD_ECHO_RETRIES = 1`), and a pending rebroadcast is only cancelled after hearing 3 copies (`group_redundancy`). Together these lifted delivery at 20% loss from 87.3% to 95.6%, at the cost of the busiest node's airtime rising from 1.9% to 2.9% under this heavy load. A second echo retry would add only 0.6 points for another 1.1 points of airtime. Signing posts makes each frame about 55 bytes longer, which raises the busiest node to about 5% airtime under this load (a post every 10 s), and posts from senders not yet known wait for the whois answer, which shows in the higher p95 latency.
 
 ## 15. Roadmap
 

@@ -41,9 +41,10 @@ pub enum HostEvent {
         channel: String,
         /// Sender's short address (8 hex characters).
         from: String,
-        /// Sender's full address, if they are a contact.
+        /// Sender's full address when their signature checked out. `None`
+        /// means unverified: anyone with the channel key could have sent it.
         from_addr: Option<String>,
-        /// Name the sender put in the message.
+        /// The verified sender's announced name; empty when unverified.
         name: String,
         text: String,
         at_ms: u64,

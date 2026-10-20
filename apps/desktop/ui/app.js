@@ -7,7 +7,7 @@ const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 
 const MAX_TEXT = 181; // MAX_DATA in nmw-core
-const MAX_GROUP_TEXT = 182; // MAX_GROUP_DATA in nmw-core
+const MAX_GROUP_TEXT = 151; // MAX_GROUP_DATA in nmw-core
 const LOG_LIMIT = 300;
 const $ = (id) => document.getElementById(id);
 
@@ -172,7 +172,11 @@ function renderChat() {
   list.replaceChildren();
   for (const m of messagesFor(state.selected)) {
     const li = el('li', `msg ${m.dir}`);
-    if (group && m.dir === 'in') li.append(el('div', 'sender', m.name));
+    if (group && m.dir === 'in') {
+      const sender = el('div', m.verified ? 'sender' : 'sender unverified', m.name);
+      if (!m.verified) sender.title = 'Signature not checked: we never got this sender\'s announce.';
+      li.append(sender);
+    }
     li.append(el('div', 'bubble', m.text));
     let meta = fmtClock(m.at_ms);
     let cls = 'meta';
@@ -308,7 +312,9 @@ function onEvent(ev) {
         dir: 'in',
         text: ev.text,
         at_ms: ev.at_ms,
-        name: ev.name || `Unknown ${ev.from}`,
+        // Names come from the sender's signed announce, never from the post.
+        verified: ev.from_addr !== null,
+        name: ev.from_addr !== null ? ev.name || `Node ${ev.from}` : `Unverified sender ${ev.from}`,
       });
       break;
     case 'delivered':

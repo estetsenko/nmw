@@ -304,10 +304,15 @@ impl VirtualMesh {
                     // In the channel Info bot only answers commands.
                     let text = String::from_utf8_lossy(data);
                     if *channel == self.public.id() && text.trim_start().starts_with('/') {
-                        let from = self.by_short.get(from).copied();
-                        let reply = self.bot_reply(Bot::Info, i, from, &text);
+                        let from_idx = self.by_short.get(from).copied();
+                        let reply = self.bot_reply(Bot::Info, i, from_idx, &text);
                         let at = t + self.rng.gen_range(BOT_DELAY);
-                        self.group_posts.push((at, i, format!("@{name} {reply}")));
+                        let who = if name.is_empty() {
+                            crate::hex(&from.0)
+                        } else {
+                            name.clone()
+                        };
+                        self.group_posts.push((at, i, format!("@{who} {reply}")));
                     }
                 }
             }
@@ -720,6 +725,10 @@ mod tests {
             got.iter().any(|(n, _)| n.starts_with("Sim user")),
             "{got:?}"
         );
+        // Nearly every post carries a verified sender (names come from
+        // announces); one whose sender's announce was lost arrives unverified.
+        let verified = got.iter().filter(|(n, _)| !n.is_empty()).count();
+        assert!(verified * 10 >= got.len() * 9, "{got:?}");
     }
 
     #[test]

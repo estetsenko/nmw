@@ -116,6 +116,8 @@ struct Stats {
     delivered: usize,
     acked: usize,
     duplicates: usize,
+    /// Group posts delivered without a verified sender.
+    unverified: usize,
     known_pairs: usize,
     pairs: usize,
     transmissions: usize,
@@ -136,6 +138,7 @@ impl Stats {
         self.delivered += o.delivered;
         self.acked += o.acked;
         self.duplicates += o.duplicates;
+        self.unverified += o.unverified;
         self.known_pairs += o.known_pairs;
         self.pairs += o.pairs;
         self.transmissions += o.transmissions;
@@ -299,7 +302,9 @@ fn simulate(args: &Args, seed: u64) -> Stats {
                             s.acked = true;
                         }
                     }
-                    Event::GroupMessage { data, .. } => {
+                    Event::GroupMessage {
+                        data, from_addr, ..
+                    } => {
                         let n = std::str::from_utf8(&data)
                             .ok()
                             .and_then(|t| t.strip_prefix("msg "))
@@ -309,6 +314,7 @@ fn simulate(args: &Args, seed: u64) -> Stats {
                                 st.duplicates += 1;
                             } else {
                                 s.delivered_at = Some(t);
+                                st.unverified += from_addr.is_none() as usize;
                             }
                         }
                     }
@@ -452,6 +458,12 @@ fn main() -> ExitCode {
         total.unknown,
         pct(total.unknown_delivered, total.unknown)
     );
+    if args.group {
+        println!(
+            "  sender verified     {:.1}% of delivered posts",
+            100.0 - pct(total.unverified, total.delivered)
+        );
+    }
     println!("  delivered by hops   {}", hops.join("  "));
     println!("  latency             p50 {p50:.2}s  p95 {p95:.2}s  max {max:.2}s");
     println!(
