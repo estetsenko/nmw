@@ -68,7 +68,7 @@ The **same core library** implements Link → Transport and is shared by firmwar
 - **Node identity:** one Ed25519 key pair from a 32-byte seed. The X25519 key-agreement key is derived from it (the libsodium `ed25519_pk_to_curve25519` mapping), so an identity is a single 32-byte public key.
 - **Node address (full):** first 16 bytes of `SHA-256(public key)`. Used in contacts, QR codes and on the internet side.
 - **On-air address (short):** first **4 bytes** of the full address. Collisions are resolved by the full address in announces and the AEAD tag failing for the wrong recipient; at 4 bytes the collision risk is negligible below ~10k nodes per mesh.
-- **Channels (groups):** identified by `hash(channel_key)[0..2]` on air plus the channel name locally.
+- **Channels (groups):** identified on air by a 4-byte id, `SHA-256("nmw-v0 channel id\0" | key)[0..4]`, carried in `dst`, plus the channel name locally. A public channel (`#name`) derives its key from the lowercased name, so anyone who knows the name can join; a private channel has a random 32-byte key shared as an invite.
 - **Services:** a node exposes ports; well-known ports: 1 text, 2 receipts, 3 voice note, 4 live voice, 5 file/resource, 6 position, 7 telemetry, 8 bot command, 9 gateway control, 100+ app-defined.
 - **Human names** are just signed fields in announces; never trusted for identity. Contacts are pinned by full address (TOFU + optional QR verification).
 - **Contacts** come from announces, from a contact request, or are shared out of band (QR code / contact file). A sender that has not yet heard back from a contact uses `DATA_KEY` (see §5), so the receiver can decrypt even if it never heard the sender's announce.
@@ -91,9 +91,10 @@ Byte   Field
 
 - **packet_id is 32-bit** (not 16) because it forms the AEAD nonce with `src`; a 16-bit counter would wrap within days on a busy node. Firmware persists the counter (or restarts it from a random value) across reboots.
 - **AAD** = version, type, routed, ack_req, packet_id, dst, src. The hop counters and path are excluded because repeaters change them.
-- **Types:** `DATA` (0), `ACK` (1), `ANNOUNCE` (2, flooded, or source-routed when answering a contact request), `GROUP` (3, reserved), `CTRL` (4: subtype 1 = contact request), `DATA_KEY` (5: DATA prefixed with the sender's 32-byte public key).
+- **Types:** `DATA` (0), `ACK` (1), `ANNOUNCE` (2, flooded, or source-routed when answering a contact request), `GROUP` (3, flooded to a channel id, not acknowledged), `CTRL` (4: subtype 1 = contact request), `DATA_KEY` (5: DATA prefixed with the sender's 32-byte public key).
 - **Payloads:**
   - `DATA`: AEAD(`seq(2) | port(2) | data`) + 8-byte tag. `seq` is the end-to-end message number used for ACKs and duplicate suppression; every (re)transmission gets a fresh packet_id. Max application data: 181 bytes.
+  - `GROUP`: AEAD under the channel key of `port(2) | name_len(1) | name | data`. The sender name is unverified: anyone with the key can post as anyone. Max application data: 182 bytes.
   - `ACK`: AEAD(`seq(2) | has_fwd_path(1) | fwd_path`). When the DATA arrived by flood, the ACK carries the path it took so the sender learns the route.
   - `ANNOUNCE`: `pubkey(32) | role(1) | name_len(1) | name(≤32) | sig(64)`, signed over `"nmwA" | packet_id | body`. About 130 bytes.
 - **Fragmentation** lives in transport (resource packets carry `resource_id(2) | frag_idx(1) | frag_count(1)`), not in the base header.
@@ -268,6 +269,16 @@ Gateway = ESP32 node or a radio attached to a Linux box running the gateway daem
 | 30% | 94.7% | 97.3% | 45 s |
 
 At 0% loss every failure is a pair more than 7 radio hops apart, beyond the 6-repeater hop limit. Contact requests lifted announce-only delivery at 20% loss from 91% to 98.5%.
+
+**Group channels** (`nmw-sim --group`: all 35 clients in one channel, 300 posts; delivery counts post × other member pairs):
+
+| Per-link loss | Delivered | p95 latency |
+|---|---|---|
+| 0% | 99.4% | 2.2 s |
+| 20% | 95.6% | 2.9 s |
+| 30% | 91.3% | 3.3 s |
+
+Group posts have no end-to-end ACK, so whoever sends or rebroadcasts one listens for a repeater further out passing it on and sends it once more if none does (`FLOOD_ECHO_RETRIES = 1`), and a pending rebroadcast is only cancelled after hearing 3 copies (`group_redundancy`). Together these lifted delivery at 20% loss from 87.3% to 95.6%, at the cost of the busiest node's airtime rising from 1.9% to 2.9% under this heavy load. A second echo retry would add only 0.6 points for another 1.1 points of airtime.
 
 ## 15. Roadmap
 

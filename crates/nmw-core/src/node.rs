@@ -17,6 +17,7 @@
 //! retransmits up to [`HOP_RETRIES`] times if it hears nothing.
 
 use crate::airtime::LoraProfile;
+use crate::channel::{Channel, ChannelId};
 use crate::crypto;
 use crate::identity::{Address, Identity, PublicIdentity, ShortAddr};
 use crate::packet::{Packet, PacketType, HEADER_LEN, MAX_FRAME, MAX_PATH};
@@ -32,7 +33,8 @@ const SEEN_TTL: Micros = 120_000_000;
 const DELIVERED_TTL: Micros = 600_000_000;
 const PRUNE_EVERY: Micros = 10_000_000;
 const TIMEOUT_MARGIN: Micros = 2_000_000;
-const MAX_NAME: usize = 32;
+/// Longest node name carried in announces and group messages, in bytes.
+pub const MAX_NAME: usize = 32;
 /// Ciphertext overhead of a DATA payload: seq(2) + port(2) + tag.
 const DATA_OVERHEAD: usize = 4 + crypto::TAG_LEN;
 /// Largest application payload [`Node::send`] accepts: room for a full path
@@ -40,8 +42,15 @@ const DATA_OVERHEAD: usize = 4 + crypto::TAG_LEN;
 pub const MAX_DATA: usize =
     MAX_FRAME - HEADER_LEN - 1 - MAX_PATH - PublicIdentity::LEN - DATA_OVERHEAD;
 
+/// Largest application payload [`Node::send_group`] accepts: room for a full
+/// flood path, the port, and a sender name of [`MAX_NAME`] bytes.
+pub const MAX_GROUP_DATA: usize =
+    MAX_FRAME - HEADER_LEN - 1 - MAX_PATH - 2 - 1 - MAX_NAME - crypto::TAG_LEN;
+
 /// Per-hop retransmissions of a source-routed packet.
 pub const HOP_RETRIES: u8 = 2;
+/// Retransmissions of a group flood nobody was heard passing on.
+pub const FLOOD_ECHO_RETRIES: u8 = 1;
 
 /// CTRL subtype: "send me your announce", flooded towards a full address.
 const CTRL_CONTACT_REQ: u8 = 1;
@@ -81,6 +90,8 @@ pub struct NodeConfig {
     pub max_retries: u8,
     /// A pending flood rebroadcast is cancelled after hearing this many other copies.
     pub redundancy: u8,
+    /// The same for group messages, which have no end-to-end retries.
+    pub group_redundancy: u8,
     /// Seed for timing jitter (take it from a hardware RNG on devices).
     pub rng_seed: u64,
 }
@@ -94,6 +105,7 @@ impl NodeConfig {
             hop_limit: 6,
             max_retries: 3,
             redundancy: 2,
+            group_redundancy: 3,
             rng_seed: 0,
         }
     }
@@ -118,12 +130,25 @@ pub enum Event {
     Delivered { to: Address, seq: u16 },
     /// No acknowledgement after all retries.
     Failed { to: Address, seq: u16 },
+    /// A message posted to a channel this node has joined.
+    GroupMessage {
+        channel: ChannelId,
+        /// The sender's short address, and its full address if it is a contact.
+        from: ShortAddr,
+        from_addr: Option<Address>,
+        /// The name the sender put in the message (unverified).
+        name: String,
+        port: u16,
+        data: Vec<u8>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SendError {
-    /// More than [`MAX_DATA`] bytes.
+    /// More than [`MAX_DATA`] (or [`MAX_GROUP_DATA`]) bytes.
     TooLarge,
+    /// [`Node::send_group`] to a channel that was not joined.
+    NotJoined,
 }
 
 struct Contact {
@@ -174,6 +199,8 @@ struct HopWatch {
     retries_left: u8,
     /// Packet id of our own DATA packet, so a dead first hop triggers an immediate flood.
     own_data_id: Option<u32>,
+    /// Watching for a flood rebroadcast, which comes after a random flood delay.
+    flood: bool,
 }
 
 impl HopWatch {
@@ -182,6 +209,19 @@ impl HopWatch {
             watch,
             retries_left: HOP_RETRIES,
             own_data_id,
+            flood: false,
+        }
+    }
+
+    /// Group messages have no end-to-end retries. Instead, whoever sends or
+    /// rebroadcasts one listens for a repeater further out passing it on, and
+    /// sends it once more if none does.
+    fn flood_echo(key: (ShortAddr, u32), hop_count: u8) -> Self {
+        HopWatch {
+            watch: Watch::Forwarded { key, hop_count },
+            retries_left: FLOOD_ECHO_RETRIES,
+            own_data_id: None,
+            flood: true,
         }
     }
 }
@@ -221,6 +261,8 @@ pub struct Node {
     outgoing: Vec<Outgoing>,
     events: VecDeque<Event>,
     contact_replies: BTreeMap<ShortAddr, Micros>,
+    /// Joined channels. Ids are only 4 bytes, so two keys may share one.
+    channels: Vec<(ChannelId, [u8; 32])>,
     next_id: u32,
     next_seq: u16,
     last_prune: Micros,
@@ -249,6 +291,7 @@ impl Node {
             outgoing: Vec::new(),
             events: VecDeque::new(),
             contact_replies: BTreeMap::new(),
+            channels: Vec::new(),
             next_id,
             next_seq,
             last_prune: now,
@@ -305,6 +348,90 @@ impl Node {
         self.contact(addr)?.route.as_deref()
     }
 
+    /// Join a channel: receive its messages and allow [`Node::send_group`] to it.
+    pub fn join_channel(&mut self, channel: &Channel) -> ChannelId {
+        let id = channel.id();
+        if !self.channels.iter().any(|&(_, k)| k == channel.key) {
+            self.channels.push((id, channel.key));
+        }
+        id
+    }
+
+    pub fn leave_channel(&mut self, channel: &Channel) {
+        self.channels.retain(|&(_, k)| k != channel.key);
+    }
+
+    /// Post `data` to a joined channel. Group messages are flooded once and
+    /// not acknowledged.
+    pub fn send_group(
+        &mut self,
+        channel: &Channel,
+        port: u16,
+        data: &[u8],
+        now: Micros,
+    ) -> Result<(), SendError> {
+        if data.len() > MAX_GROUP_DATA {
+            return Err(SendError::TooLarge);
+        }
+        if !self.channels.iter().any(|&(_, k)| k == channel.key) {
+            return Err(SendError::NotJoined);
+        }
+        let id = self.alloc_id();
+        let mut packet = Packet {
+            ptype: PacketType::Group,
+            routed: false,
+            ack_req: false,
+            hop_limit: self.config.hop_limit,
+            hop_count: 0,
+            id,
+            dst: ShortAddr(channel.id().0),
+            src: self.me,
+            path: Vec::new(),
+            payload: Vec::new(),
+        };
+        let name = self.config.name.as_bytes();
+        let name = &name[..name.len().min(MAX_NAME)];
+        let mut buf = Vec::with_capacity(3 + name.len() + data.len() + crypto::TAG_LEN);
+        buf.extend_from_slice(&port.to_be_bytes());
+        buf.push(name.len() as u8);
+        buf.extend_from_slice(name);
+        buf.extend_from_slice(data);
+        crypto::seal(&channel.key, &packet.nonce(), &packet.aad(), &mut buf);
+        packet.payload = buf;
+        let hop = HopWatch::flood_echo((self.me, id), 0);
+        self.enqueue(now, PRIO_DATA, packet.encode(), None, Some(hop));
+        Ok(())
+    }
+
+    fn on_group(&mut self, packet: &Packet) {
+        let channel = ChannelId(packet.dst.0);
+        for &(id, key) in &self.channels {
+            if id != channel {
+                continue;
+            }
+            let mut buf = packet.payload.clone();
+            if !crypto::open(&key, &packet.nonce(), &packet.aad(), &mut buf) {
+                continue;
+            }
+            if buf.len() < 3 || buf.len() < 3 + buf[2] as usize {
+                return;
+            }
+            let port = u16::from_be_bytes([buf[0], buf[1]]);
+            let name_end = 3 + buf[2] as usize;
+            let name = String::from_utf8_lossy(&buf[3..name_end]).into_owned();
+            let from_addr = self.contacts.get(&packet.src).map(|c| c.addr);
+            self.events.push_back(Event::GroupMessage {
+                channel,
+                from: packet.src,
+                from_addr,
+                name,
+                port,
+                data: buf[name_end..].to_vec(),
+            });
+            return;
+        }
+    }
+
     /// Number of messages waiting for an acknowledgement.
     pub fn pending_messages(&self) -> usize {
         self.outgoing.len()
@@ -347,6 +474,12 @@ impl Node {
     fn hop_timeout(&self, len: usize) -> Micros {
         let air = self.airtime(len + 1);
         3 * air + air / 2 + 200_000
+    }
+
+    /// Wait for a flood rebroadcast: its airtime plus the longest flood delay.
+    fn flood_echo_timeout(&self, len: usize) -> Micros {
+        let air = self.airtime(len + 1);
+        air + max_flood_delay(air) + air / 2 + 200_000
     }
 
     /// Flood an announce carrying this node's public keys, role and name.
@@ -628,7 +761,12 @@ impl Node {
         if self.seen.contains_key(&key) {
             if let Some(pos) = self.queue.iter().position(|q| q.flood_key == Some(key)) {
                 self.queue[pos].heard += 1;
-                if self.queue[pos].heard >= self.config.redundancy {
+                let limit = if packet.ptype == PacketType::Group {
+                    self.config.group_redundancy
+                } else {
+                    self.config.redundancy
+                };
+                if self.queue[pos].heard >= limit {
                     self.queue.remove(pos);
                 }
             }
@@ -640,6 +778,10 @@ impl Node {
         match packet.ptype {
             PacketType::Announce => {
                 self.on_announce(&packet);
+                self.forward(packet, snr_db, now);
+            }
+            PacketType::Group => {
+                self.on_group(&packet);
                 self.forward(packet, snr_db, now);
             }
             PacketType::Data | PacketType::DataKey if for_me => self.on_data(&packet, now),
@@ -713,13 +855,10 @@ impl Node {
             _ => PRIO_FORWARD,
         };
         let delay = self.flood_delay(snr_db, self.airtime(frame.len()));
-        self.enqueue(
-            now + delay,
-            prio,
-            frame,
-            Some((packet.src, packet.id)),
-            None,
-        );
+        let key = (packet.src, packet.id);
+        let hop = (packet.ptype == PacketType::Group)
+            .then(|| HopWatch::flood_echo(key, packet.hop_count));
+        self.enqueue(now + delay, prio, frame, Some(key), hop);
     }
 
     fn on_announce(&mut self, packet: &Packet) {
@@ -1029,7 +1168,12 @@ impl Node {
                 hop,
                 frame: q.frame.clone(),
                 prio: q.prio,
-                deadline: now + self.hop_timeout(q.frame.len()),
+                deadline: now
+                    + if hop.flood {
+                        self.flood_echo_timeout(q.frame.len())
+                    } else {
+                        self.hop_timeout(q.frame.len())
+                    },
             });
         }
         Some(q.frame)
@@ -1115,6 +1259,77 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn group_message_reaches_members_through_a_repeater() {
+        // 0 - 1(repeater) - 2, and 3 next to the repeater but not in the channel.
+        let mut nodes = vec![
+            node(1, Role::Client),
+            node(2, Role::Repeater),
+            node(3, Role::Client),
+            node(4, Role::Client),
+        ];
+        let links = vec![vec![1], vec![0, 2, 3], vec![1], vec![1]];
+        let ch = Channel::public("#test");
+        for i in [0, 2] {
+            nodes[i].join_channel(&ch);
+        }
+        nodes[0].send_group(&ch, 1, b"hello all", 0).unwrap();
+        let events = run(&mut nodes, &links, 0, 10_000_000);
+        let got: Vec<_> = events
+            .iter()
+            .filter_map(|(i, e)| match e {
+                Event::GroupMessage {
+                    channel,
+                    from,
+                    data,
+                    ..
+                } => Some((*i, *channel, *from, data.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![(2, ch.id(), nodes[0].me, b"hello all".to_vec())],
+            "only the other member receives it, exactly once"
+        );
+    }
+
+    #[test]
+    fn group_send_checks_membership_and_size() {
+        let mut n = node(1, Role::Client);
+        let ch = Channel::from_key([7; 32]);
+        assert_eq!(n.send_group(&ch, 1, b"x", 0), Err(SendError::NotJoined));
+        n.join_channel(&ch);
+        assert_eq!(
+            n.send_group(&ch, 1, &[0; MAX_GROUP_DATA + 1], 0),
+            Err(SendError::TooLarge)
+        );
+        n.send_group(&ch, 1, &[0; MAX_GROUP_DATA], 0).unwrap();
+        let frame = n.poll_transmit(0).unwrap();
+        // A full path still fits after up to MAX_PATH repeaters append their tags.
+        assert!(frame.len() + 1 + MAX_PATH <= MAX_FRAME);
+        n.leave_channel(&ch);
+        assert_eq!(n.send_group(&ch, 1, b"x", 0), Err(SendError::NotJoined));
+    }
+
+    #[test]
+    fn group_flood_is_resent_once_when_nobody_passes_it_on() {
+        let mut n = node(1, Role::Client);
+        let ch = Channel::from_key([7; 32]);
+        n.join_channel(&ch);
+        n.send_group(&ch, 1, b"anyone?", 0).unwrap();
+        let mut sent = 0;
+        let mut t = 0;
+        while t < 30_000_000 {
+            n.tick(t);
+            while n.poll_transmit(t).is_some() {
+                sent += 1;
+            }
+            t += 10_000;
+        }
+        assert_eq!(sent, 1 + FLOOD_ECHO_RETRIES as usize);
     }
 
     #[test]

@@ -14,4 +14,5 @@ tauri-build = { version = "2", features = [] }
 nmw-host = { path = "../../../crates/nmw-host" }
 tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 rand = "0.8"

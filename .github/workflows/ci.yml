@@ -32,6 +32,8 @@ jobs:
         run: cargo run --release -p nmw-sim -- --seeds 20 --shared-contacts --loss 0.2 --min-delivery 0.95
       - name: Simulator gate, contacts from announces and contact requests
         run: cargo run --release -p nmw-sim -- --seeds 20 --loss 0.2 --min-delivery 0.95
+      - name: Simulator gate, group channel
+        run: cargo run --release -p nmw-sim -- --seeds 20 --group --loss 0.2 --min-delivery 0.93
 
   desktop:
     runs-on: ubuntu-latest

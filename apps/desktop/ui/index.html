@@ -37,15 +37,27 @@
         <button type="submit">Open</button>
       </form>
       <p id="new-chat-error" class="error" hidden></p>
-      <h2>Contacts <span id="contact-count" class="count"></span></h2>
-      <ul id="contacts" class="contacts"></ul>
-      <p id="contacts-empty" class="empty">Listening for announces…</p>
+      <div class="lists">
+        <h2>Channels</h2>
+        <ul id="channels" class="contacts"></ul>
+        <form id="join-channel" class="join-channel">
+          <div class="row">
+            <input id="channel-name" placeholder="#name, or a new private channel" autocomplete="off" spellcheck="false" maxlength="32">
+            <button type="submit">Join</button>
+          </div>
+          <input id="channel-key" placeholder="Key from an invite (optional)" autocomplete="off" spellcheck="false">
+        </form>
+        <p id="join-error" class="error" hidden></p>
+        <h2>Contacts <span id="contact-count" class="count"></span></h2>
+        <ul id="contacts" class="contacts"></ul>
+        <p id="contacts-empty" class="empty">Listening for announces…</p>
+      </div>
     </aside>
 
     <section class="chat" id="chat">
       <div class="chat-empty" id="chat-empty">
         <h1>No chat selected</h1>
-        <p>Pick a contact on the left. In the simulated mesh, <b>Echo bot</b> repeats what you send and <b>Info bot</b> answers <code>/help</code>.</p>
+        <p>Pick a channel or a contact on the left. In the simulated mesh, <b>#public</b> has other users chatting, <b>Echo bot</b> repeats what you send and <b>Info bot</b> answers <code>/help</code>, also in channels.</p>
       </div>
       <div class="chat-main" id="chat-main" hidden>
         <div class="chat-head">
@@ -53,7 +65,11 @@
             <h1 id="chat-name"></h1>
             <code id="chat-addr" class="full-addr"></code>
           </div>
-          <span id="chat-route" class="route"></span>
+          <div class="chat-side">
+            <span id="chat-route" class="route"></span>
+            <button id="share-key" class="ghost small" hidden>Copy invite key</button>
+            <button id="leave" class="ghost small" hidden>Leave</button>
+          </div>
         </div>
         <ol id="messages" class="messages"></ol>
         <form id="composer" class="composer">
