@@ -133,8 +133,9 @@ Hybrid of managed flooding and learned source routes. The two existing approache
 |---|---|---|
 | Datagram | Fire and forget | Position, telemetry, live voice |
 | Reliable | End-to-end ACK, up to 3 retries with backoff, receipts | Text, bot commands |
-| Resource | Fragmented, windowed (window 4), selective ACK bitmap, resumable | Files, voice notes, images |
+| Resource | An offer, then chunks sent one at a time as reliable messages; the receiver checks a hash | Files, voice notes, images |
 
+- **Files (port 5, DMs only):** the sender first sends an offer `0 | id(2) | size(4) | count(2) | sha256[..16] | name | mime` and, once it is acknowledged, the file as chunks `1 | id(2) | index(2) | bytes` of up to 176 bytes, each an ordinary reliable DATA message. A chunk the node gives up on is sent again up to twice before the transfer fails and the sender sends `2 | id(2)` (cancel). Files are limited to 32 KB, and the app shrinks photos to about 12 KB first. Only one chunk is in flight at a time: in the simulator a window of 3 was slower (LoRa is half duplex, so the next chunk collides with the ACK for the last), 140 s against 100 s per hop for 10 KB at 10% loss, and used more airtime. The receiver drops a transfer that gets no chunk for 5 minutes.
 - **Priority queue at the MAC:** ACK > live voice > text > control > resources > announces.
 - **Store-and-forward:** `room` and `gateway` nodes hold messages for clients that announced but are asleep or out of range; clients poll on wake ("anything for me?").
 - **Message payloads** use a compact binary encoding (CBOR) [default] so apps can add fields without breaking older nodes.

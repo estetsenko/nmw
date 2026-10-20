@@ -14,6 +14,13 @@ const PART_HEADER = 4;
 const MAX_PARTS = 16;
 const MAX_TEXT = MAX_PARTS * (MAX_DATA - PART_HEADER);
 const MAX_GROUP_TEXT = MAX_PARTS * (MAX_GROUP_DATA - PART_HEADER);
+// Files go to contacts in chunks (nmw-core file.rs); photos are shrunk first
+// because every kilobyte costs about 10 s of airtime per hop.
+const MAX_FILE = 32 * 1024;
+const PHOTO_TARGET = 12 * 1024;
+const PHOTO_MAX_SIDE = 640;
+// Shown inline; anything else (SVG included) is offered as a file to save.
+const INLINE_IMAGES = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
 const LOG_LIMIT = 300;
 const $ = (id) => document.getElementById(id);
 
@@ -22,7 +29,9 @@ const state = {
   me: null,
   contacts: new Map(), // addr -> {addr, name, hops}
   channels: new Map(), // id -> {id, name, public, key}
-  chats: new Map(), // conversation key -> [{dir, text, seq, at_ms, status, name}]
+  // conversation key -> [{dir, text, seq, at_ms, status, name}], or for a file
+  // {dir, file: {id, name, mime, size, data}, at_ms, status, done, count}
+  chats: new Map(),
   unread: new Map(), // conversation key -> count
   early: new Map(), // `${to}:${seq}` -> status that arrived before send_text returned
   selected: null, // conversation key
@@ -39,6 +48,10 @@ function fmtClock(ms) {
   const s = Math.floor(ms / 1000);
   const pad = (n) => String(n).padStart(2, '0');
   return `${pad(Math.floor(s / 3600))}:${pad(Math.floor(s / 60) % 60)}:${pad(s % 60)}`;
+}
+
+function fmtSize(n) {
+  return n < 1024 ? `${n} B` : `${(n / 1024).toFixed(1)} KB`;
 }
 
 function routeText(hops) {
@@ -111,6 +124,8 @@ function upsertContact(c) {
 const ICONS = {
   public: ['M12 3a9 9 0 1 0 0 18a9 9 0 1 0 0-18', 'M3 12h18', 'M12 3c3 3.2 3 14.8 0 18', 'M12 3c-3 3.2-3 14.8 0 18'],
   private: ['M6 11h12v9H6z', 'M8.5 11V8a3.5 3.5 0 0 1 7 0v3'],
+  attach: ['M20 11.5l-8 8a5 5 0 0 1-7-7l8.5-8.5a3.3 3.3 0 0 1 4.7 4.7l-8.4 8.4a1.7 1.7 0 0 1-2.4-2.4l7.6-7.6'],
+  file: ['M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z', 'M14 3v5h5'],
 };
 
 function icon(name) {
@@ -205,6 +220,7 @@ function renderChatHead() {
   }
   $('chat-addr').classList.toggle('desc', !!channel);
   $('share-key').hidden = !channel || channel.public;
+  $('attach').hidden = !!channel;
   $('leave').hidden = !channel;
 }
 
@@ -224,10 +240,16 @@ function renderChat() {
       if (!m.verified) sender.title = 'Signature not checked: we never got this sender\'s announce.';
       li.append(sender);
     }
-    li.append(el('div', 'bubble', m.text));
+    if (m.file) {
+      li.append(fileBubble(m));
+    } else {
+      li.append(el('div', 'bubble', m.text));
+    }
     let meta = fmtClock(m.at_ms);
     let cls = 'meta';
-    if (m.dir === 'out' && group) {
+    if (m.file) {
+      [meta, cls] = fileMeta(m, meta, cls);
+    } else if (m.dir === 'out' && group) {
       meta += ' · Sent';
     } else if (m.dir === 'out') {
       if (m.status === 'delivered') {
@@ -244,6 +266,82 @@ function renderChat() {
     list.append(li);
   }
   list.scrollTop = list.scrollHeight;
+}
+
+function fileBubble(m) {
+  const f = m.file;
+  const b = el('div', 'bubble file');
+  if (f.data && INLINE_IMAGES.includes(f.mime)) {
+    const img = el('img', 'photo');
+    img.src = `data:${f.mime};base64,${f.data}`;
+    img.alt = f.name;
+    b.append(img);
+  } else {
+    const card = el('div', 'file-card');
+    card.append(icon('file'));
+    const info = el('div');
+    info.append(el('div', 'file-name', f.name));
+    info.append(el('div', 'file-size', fmtSize(f.size)));
+    card.append(info);
+    b.append(card);
+  }
+  if ((m.status === 'sending' || m.status === 'receiving') && m.count) {
+    const bar = el('div', 'progress');
+    const fill = el('div');
+    fill.style.width = `${Math.round((100 * m.done) / m.count)}%`;
+    bar.append(fill);
+    b.append(bar);
+  }
+  if (m.dir === 'in' && f.data) {
+    const save = el('button', 'ghost small save', m.saved ? 'Saved' : 'Save');
+    save.title = m.saved || 'Save to Downloads';
+    save.addEventListener('click', () => saveFile(m));
+    b.append(save);
+  }
+  return b;
+}
+
+function fileMeta(m, meta, cls) {
+  const part = m.count ? ` ${m.done}/${m.count}` : '';
+  switch (m.status) {
+    case 'sending':
+      return [`${meta} · Sending${part}`, cls];
+    case 'sent':
+      return [`${meta} · Delivered`, `${cls} delivered`];
+    case 'receiving':
+      return [`${meta} · Receiving${part}`, cls];
+    case 'failed':
+      return [`${meta} · ${m.dir === 'out' ? 'Not delivered' : 'Transfer failed'}`, `${cls} failed`];
+    default:
+      return [m.saved ? `${meta} · Saved to ${m.saved}` : meta, cls];
+  }
+}
+
+// The newest file message in `peer`'s chat with transfer `id` in that direction.
+function findFile(peer, id, dir) {
+  const list = messagesFor(`c:${peer}`);
+  for (let i = list.length - 1; i >= 0; i--) {
+    const m = list[i];
+    if (m.file && m.file.id === id && m.dir === dir) return m;
+  }
+  return null;
+}
+
+function updateFile(peer, id, dir, change) {
+  const m = findFile(peer, id, dir);
+  if (!m) return;
+  Object.assign(m, change);
+  if (state.selected === `c:${peer}`) renderChat();
+}
+
+async function saveFile(m) {
+  try {
+    m.saved = await invoke('save_file', { name: m.file.name, data: m.file.data });
+    showError('send-error');
+  } catch (err) {
+    showError('send-error', String(err));
+  }
+  renderChat();
 }
 
 function setOutgoingStatus(to, seq, status) {
@@ -304,6 +402,97 @@ async function send() {
     if (key === state.selected) renderChat();
   } catch (err) {
     showError('send-error', String(err));
+  }
+}
+
+// ---- files ----
+
+function readDataUrl(blob) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(r.result);
+    r.onerror = () => reject(r.error);
+    r.readAsDataURL(blob);
+  });
+}
+
+function loadImage(url) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error('could not read the image'));
+    img.src = url;
+  });
+}
+
+function canvasBlob(canvas, type, quality) {
+  return new Promise((resolve) => canvas.toBlob(resolve, type, quality));
+}
+
+// Scale a photo down and re-encode it until it is about PHOTO_TARGET bytes.
+async function shrinkPhoto(file) {
+  const img = await loadImage(await readDataUrl(file));
+  const canvas = document.createElement('canvas');
+  let side = PHOTO_MAX_SIDE;
+  let best = null;
+  while (side >= 120) {
+    const scale = Math.min(1, side / Math.max(img.naturalWidth, img.naturalHeight));
+    canvas.width = Math.max(1, Math.round(img.naturalWidth * scale));
+    canvas.height = Math.max(1, Math.round(img.naturalHeight * scale));
+    canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
+    for (const q of [0.7, 0.55, 0.4]) {
+      // WebKit has no WebP encoder and falls back to PNG; use JPEG there.
+      let blob = await canvasBlob(canvas, 'image/webp', q);
+      if (!blob || blob.type !== 'image/webp') blob = await canvasBlob(canvas, 'image/jpeg', q);
+      if (!blob) continue;
+      if (!best || blob.size < best.size) best = blob;
+      if (blob.size <= PHOTO_TARGET) return blob;
+    }
+    side = Math.round(side * 0.75);
+  }
+  return best;
+}
+
+function base64(bytes) {
+  let s = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    s += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(s);
+}
+
+async function sendFile(file) {
+  const key = state.selected;
+  if (!key || isChannel(key)) return;
+  let blob = file;
+  let name = file.name || 'file';
+  try {
+    if (INLINE_IMAGES.includes(file.type) && file.type !== 'image/gif') {
+      blob = await shrinkPhoto(file);
+      if (!blob) throw new Error('could not shrink the photo');
+      const ext = blob.type === 'image/webp' ? 'webp' : 'jpg';
+      name = `${name.replace(/\.[^.]*$/, '')}.${ext}`;
+    }
+    if (blob.size > MAX_FILE) {
+      showError('send-error', `Files are limited to ${MAX_FILE / 1024} KB; this one is ${fmtSize(blob.size)}.`);
+      return;
+    }
+    const data = base64(new Uint8Array(await blob.arrayBuffer()));
+    const mime = blob.type || 'application/octet-stream';
+    const to = key.slice(2);
+    const id = await invoke('send_file', { to, name, mime, data });
+    showError('send-error');
+    messagesFor(key).push({
+      dir: 'out',
+      file: { id, name, mime, size: blob.size, data },
+      at_ms: state.me ? state.me.time_ms : 0,
+      status: 'sending',
+      done: 0,
+      count: Math.ceil(blob.size / (MAX_DATA - 5)), // chunk header is 5 bytes
+    });
+    if (key === state.selected) renderChat();
+  } catch (err) {
+    showError('send-error', String(err.message || err));
   }
 }
 
@@ -370,6 +559,38 @@ function onEvent(ev) {
       break;
     case 'failed':
       setOutgoingStatus(ev.to, ev.seq, 'failed');
+      break;
+    case 'file_offered':
+      if (!state.contacts.has(ev.from)) {
+        upsertContact({ addr: ev.from, name: `Unknown ${shortAddr(ev.from)}`, hops: null });
+      }
+      receive(`c:${ev.from}`, {
+        dir: 'in',
+        file: { id: ev.id, name: ev.name, mime: ev.mime, size: ev.size },
+        at_ms: ev.at_ms,
+        status: 'receiving',
+        done: 0,
+        count: 0,
+      });
+      break;
+    case 'file_progress':
+      updateFile(ev.peer, ev.id, ev.outgoing ? 'out' : 'in', { done: ev.done, count: ev.count });
+      break;
+    case 'file_received': {
+      const m = findFile(ev.from, ev.id, 'in');
+      if (m) {
+        m.file.data = ev.data;
+        m.status = 'received';
+        m.at_ms = ev.at_ms;
+        if (state.selected === `c:${ev.from}`) renderChat();
+      }
+      break;
+    }
+    case 'file_sent':
+      updateFile(ev.to, ev.id, 'out', { status: 'sent' });
+      break;
+    case 'file_failed':
+      updateFile(ev.peer, ev.id, ev.outgoing ? 'out' : 'in', { status: 'failed' });
       break;
     case 'radio':
       addLog(ev);
@@ -494,6 +715,14 @@ $('copy-addr').addEventListener('click', () => {
 });
 
 $('announce').addEventListener('click', () => invoke('announce'));
+
+$('attach').append(icon('attach'));
+$('attach').addEventListener('click', () => $('file-input').click());
+$('file-input').addEventListener('change', () => {
+  const file = $('file-input').files[0];
+  $('file-input').value = '';
+  if (file) sendFile(file);
+});
 
 $('toggle-log').addEventListener('click', () => {
   const btn = $('toggle-log');

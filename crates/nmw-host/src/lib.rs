@@ -5,10 +5,12 @@
 //! serial/BLE link to a real radio. [`Runtime`] drives a mesh in real time
 //! on a background thread and hands [`HostEvent`]s to a callback.
 
+mod files;
 mod long_text;
 mod runtime;
 mod virtual_mesh;
 
+pub use files::{FileEvent, FileLayer, MAX_FILE};
 pub use long_text::{TextLayer, MAX_GROUP_TEXT, MAX_TEXT};
 pub use runtime::Runtime;
 pub use virtual_mesh::{VirtualMesh, VirtualMeshConfig, PUBLIC_CHANNEL};
@@ -50,6 +52,43 @@ pub enum HostEvent {
         name: String,
         text: String,
         at_ms: u64,
+    },
+    /// Someone started sending us a file.
+    FileOffered {
+        from: String,
+        id: u16,
+        name: String,
+        mime: String,
+        size: u32,
+        at_ms: u64,
+    },
+    /// Chunks of a file sent (`outgoing`) or received so far.
+    FileProgress {
+        peer: String,
+        id: u16,
+        outgoing: bool,
+        done: u16,
+        count: u16,
+    },
+    /// A whole file arrived; `data` is base64.
+    FileReceived {
+        from: String,
+        id: u16,
+        name: String,
+        mime: String,
+        data: String,
+        at_ms: u64,
+    },
+    /// Every chunk of a file we sent was acknowledged.
+    FileSent {
+        to: String,
+        id: u16,
+    },
+    /// A transfer was given up, by us or by the other side.
+    FileFailed {
+        peer: String,
+        id: u16,
+        outgoing: bool,
     },
     /// A frame this node sent or heard.
     Radio(RadioLogEntry),
@@ -167,6 +206,74 @@ pub trait Mesh: Send {
     fn leave_channel(&mut self, id: &str);
     fn channels(&self) -> Vec<ChannelInfo>;
     fn send_group(&mut self, id: &str, text: &str) -> Result<(), String>;
+    /// Send a file of up to [`MAX_FILE`] bytes to a contact. Returns the
+    /// transfer id used in the `File*` events.
+    fn send_file(
+        &mut self,
+        to: &Address,
+        name: &str,
+        mime: &str,
+        data: Vec<u8>,
+    ) -> Result<u16, String>;
+}
+
+impl HostEvent {
+    /// The host form of a file transfer event, `at_ms` being now.
+    pub fn from_file(ev: FileEvent, at_ms: u64) -> HostEvent {
+        use base64::Engine;
+        match ev {
+            FileEvent::Offered {
+                from,
+                id,
+                name,
+                mime,
+                size,
+            } => HostEvent::FileOffered {
+                from: addr_to_hex(&from),
+                id,
+                name,
+                mime,
+                size,
+                at_ms,
+            },
+            FileEvent::Progress {
+                peer,
+                id,
+                outgoing,
+                done,
+                count,
+            } => HostEvent::FileProgress {
+                peer: addr_to_hex(&peer),
+                id,
+                outgoing,
+                done,
+                count,
+            },
+            FileEvent::Received {
+                from,
+                id,
+                name,
+                mime,
+                data,
+            } => HostEvent::FileReceived {
+                from: addr_to_hex(&from),
+                id,
+                name,
+                mime,
+                data: base64::engine::general_purpose::STANDARD.encode(data),
+                at_ms,
+            },
+            FileEvent::Sent { to, id } => HostEvent::FileSent {
+                to: addr_to_hex(&to),
+                id,
+            },
+            FileEvent::Failed { peer, id, outgoing } => HostEvent::FileFailed {
+                peer: addr_to_hex(&peer),
+                id,
+                outgoing,
+            },
+        }
+    }
 }
 
 pub(crate) fn hex(bytes: &[u8]) -> String {

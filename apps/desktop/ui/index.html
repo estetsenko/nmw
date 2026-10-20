@@ -73,6 +73,8 @@
         </div>
         <ol id="messages" class="messages"></ol>
         <form id="composer" class="composer">
+          <button type="button" id="attach" class="ghost attach" title="Send a photo or file" aria-label="Send a photo or file"></button>
+          <input type="file" id="file-input" hidden>
           <textarea id="text" rows="2" placeholder="Write a message. Enter sends, Shift+Enter adds a line."></textarea>
           <div class="composer-side">
             <span id="bytes" class="bytes"></span>
