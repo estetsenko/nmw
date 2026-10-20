@@ -115,3 +115,33 @@ jobs:
             ${{ matrix.bundle }}/dmg/*.dmg
             ${{ matrix.bundle }}/msi/*.msi
             ${{ matrix.bundle }}/nsis/*.exe
+
+  # Every push to main replaces the "Latest build" pre-release with the
+  # packages from this run, so the newest installers are one click away
+  # without signing in. Tagged versions keep their own draft releases.
+  publish-latest:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: publish-latest
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: nmw-desktop-*
+          path: dist
+      - name: Replace the Latest build release
+        run: |
+          gh release delete latest-build --cleanup-tag --yes || true
+          gh release create latest-build \
+            --prerelease \
+            --target "$GITHUB_SHA" \
+            --title "Latest build" \
+            --notes "Desktop packages built from main at ${GITHUB_SHA::7}. Not code-signed: on macOS use System Settings > Privacy & Security > Open Anyway on first launch." \
+            $(find dist -type f)
