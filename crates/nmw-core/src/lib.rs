@@ -18,7 +18,7 @@ mod rng;
 
 pub use airtime::LoraProfile;
 pub use identity::{Address, Identity, PublicIdentity, ShortAddr};
-pub use node::{Event, Node, NodeConfig, Role, SendError};
+pub use node::{Event, Node, NodeConfig, Role, SendError, MAX_DATA};
 pub use packet::{Packet, PacketType};
 
 /// Well-known service ports.

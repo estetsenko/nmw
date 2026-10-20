@@ -5,7 +5,7 @@ use hkdf::Hkdf;
 use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey as DhPublic, StaticSecret};
 
-/// Full 16-byte node address: `SHA-256(signing_pub || dh_pub)[..16]`.
+/// Full 16-byte node address: `SHA-256(signing_pub)[..16]`.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct Address(pub [u8; 16]);
 
@@ -29,40 +29,39 @@ impl ShortAddr {
     }
 }
 
-/// The public half of an identity, as carried in announces.
+/// The public half of an identity, as carried in announces: one Ed25519 key.
+/// The X25519 key used for key agreement is derived from it (as libsodium's
+/// `crypto_sign_ed25519_pk_to_curve25519`), which saves 32 bytes per announce.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct PublicIdentity {
     signing: VerifyingKey,
-    dh: [u8; 32],
 }
 
 impl PublicIdentity {
-    pub const LEN: usize = 64;
+    pub const LEN: usize = 32;
 
     pub fn address(&self) -> Address {
-        let mut h = Sha256::new();
-        h.update(self.signing.as_bytes());
-        h.update(self.dh);
-        let digest = h.finalize();
+        let digest = Sha256::digest(self.signing.as_bytes());
         let mut a = [0u8; 16];
         a.copy_from_slice(&digest[..16]);
         Address(a)
     }
 
-    pub fn to_bytes(&self) -> [u8; 64] {
-        let mut b = [0u8; 64];
-        b[..32].copy_from_slice(self.signing.as_bytes());
-        b[32..].copy_from_slice(&self.dh);
-        b
+    pub fn to_bytes(&self) -> [u8; 32] {
+        self.signing.to_bytes()
     }
 
-    pub fn from_bytes(b: &[u8; 64]) -> Option<Self> {
-        let mut s = [0u8; 32];
-        s.copy_from_slice(&b[..32]);
-        let mut dh = [0u8; 32];
-        dh.copy_from_slice(&b[32..]);
-        let signing = VerifyingKey::from_bytes(&s).ok()?;
-        Some(PublicIdentity { signing, dh })
+    /// Rejects keys that are not valid points or have small order.
+    pub fn from_bytes(b: &[u8; 32]) -> Option<Self> {
+        let signing = VerifyingKey::from_bytes(b).ok()?;
+        if signing.is_weak() {
+            return None;
+        }
+        Some(PublicIdentity { signing })
+    }
+
+    fn dh(&self) -> DhPublic {
+        DhPublic::from(self.signing.to_montgomery().to_bytes())
     }
 
     /// Verify an Ed25519 signature made by this identity.
@@ -84,14 +83,9 @@ impl Identity {
     /// Derive an identity from a 32-byte seed (draw it from a hardware RNG).
     pub fn from_seed(seed: &[u8; 32]) -> Self {
         let signing = SigningKey::from_bytes(seed);
-        let mut dh_bytes = [0u8; 32];
-        Hkdf::<Sha256>::new(Some(b"nmw-v0 identity"), seed)
-            .expand(b"x25519", &mut dh_bytes)
-            .expect("32 bytes is a valid HKDF output length");
-        let dh = StaticSecret::from(dh_bytes);
+        let dh = StaticSecret::from(signing.to_scalar_bytes());
         let public = PublicIdentity {
             signing: signing.verifying_key(),
-            dh: DhPublic::from(&dh).to_bytes(),
         };
         Identity {
             signing,
@@ -113,9 +107,9 @@ impl Identity {
     }
 
     /// Symmetric key shared with `peer`: X25519, then HKDF bound to both addresses.
-    /// Returns `None` for a low-order (non-contributory) peer key.
+    /// Returns `None` for a non-contributory result.
     pub fn pair_key(&self, peer: &PublicIdentity) -> Option<[u8; 32]> {
-        let shared = self.dh.diffie_hellman(&DhPublic::from(peer.dh));
+        let shared = self.dh.diffie_hellman(&peer.dh());
         if !shared.was_contributory() {
             return None;
         }

@@ -26,6 +26,16 @@ pub enum PacketType {
     Announce = 2,
     Group = 3,
     Ctrl = 4,
+    /// DATA prefixed with the sender's 32-byte public key, used until the
+    /// destination has proven it knows the sender (so it can decrypt without
+    /// having heard the sender's announce).
+    DataKey = 5,
+}
+
+impl PacketType {
+    pub fn is_data(self) -> bool {
+        matches!(self, PacketType::Data | PacketType::DataKey)
+    }
 }
 
 impl PacketType {
@@ -36,6 +46,7 @@ impl PacketType {
             2 => PacketType::Announce,
             3 => PacketType::Group,
             4 => PacketType::Ctrl,
+            5 => PacketType::DataKey,
             _ => return None,
         })
     }

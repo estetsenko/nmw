@@ -10,6 +10,11 @@
 //! repeaters append their tag to the path. The receiver answers along the
 //! reversed path and returns the forward path in its ACK, so both ends learn
 //! a source route. Routes that fail twice fall back to flooding.
+//!
+//! Source-routed hops are made reliable with implicit ACKs: after sending,
+//! a node listens for the next repeater forwarding the packet (or, on the
+//! last hop of a DATA packet, for any packet from the destination) and
+//! retransmits up to [`HOP_RETRIES`] times if it hears nothing.
 
 use crate::airtime::LoraProfile;
 use crate::crypto;
@@ -30,6 +35,13 @@ const TIMEOUT_MARGIN: Micros = 2_000_000;
 const MAX_NAME: usize = 32;
 /// Ciphertext overhead of a DATA payload: seq(2) + port(2) + tag.
 const DATA_OVERHEAD: usize = 4 + crypto::TAG_LEN;
+/// Largest application payload [`Node::send`] accepts: room for a full path
+/// and the sender key on a first message.
+pub const MAX_DATA: usize =
+    MAX_FRAME - HEADER_LEN - 1 - MAX_PATH - PublicIdentity::LEN - DATA_OVERHEAD;
+
+/// Per-hop retransmissions of a source-routed packet.
+pub const HOP_RETRIES: u8 = 2;
 
 const PRIO_ACK: u8 = 0;
 const PRIO_FORWARD: u8 = 1;
@@ -117,6 +129,8 @@ struct Contact {
     key: [u8; 32],
     /// Repeater tags from this node to the contact; empty means direct neighbour.
     route: Option<Vec<u8>>,
+    /// We received an authenticated packet from them, so they know our key.
+    confirmed: bool,
 }
 
 struct Queued {
@@ -126,6 +140,53 @@ struct Queued {
     /// Set for flood rebroadcasts, which are cancelled when enough copies are overheard.
     flood_key: Option<(ShortAddr, u32)>,
     heard: u8,
+    hop: Option<HopWatch>,
+}
+
+/// What proves that a source-routed hop got through.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Watch {
+    /// The next repeater retransmits this packet with a higher hop count.
+    Forwarded {
+        key: (ShortAddr, u32),
+        hop_count: u8,
+    },
+    /// The destination transmits anything (normally its ACK).
+    ReplyFrom(ShortAddr),
+}
+
+impl Watch {
+    fn satisfied_by(&self, p: &Packet) -> bool {
+        match *self {
+            Watch::Forwarded { key, hop_count } => key == (p.src, p.id) && p.hop_count > hop_count,
+            Watch::ReplyFrom(a) => p.src == a,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct HopWatch {
+    watch: Watch,
+    retries_left: u8,
+    /// Packet id of our own DATA packet, so a dead first hop triggers an immediate flood.
+    own_data_id: Option<u32>,
+}
+
+impl HopWatch {
+    fn new(watch: Watch, own_data_id: Option<u32>) -> Self {
+        HopWatch {
+            watch,
+            retries_left: HOP_RETRIES,
+            own_data_id,
+        }
+    }
+}
+
+struct HopPending {
+    hop: HopWatch,
+    frame: Vec<u8>,
+    prio: u8,
+    deadline: Micros,
 }
 
 struct Outgoing {
@@ -136,6 +197,7 @@ struct Outgoing {
     attempts: u8,
     routed_attempts: u8,
     last_routed: bool,
+    last_id: u32,
     deadline: Micros,
 }
 
@@ -148,6 +210,7 @@ pub struct Node {
     seen: BTreeMap<(ShortAddr, u32), Micros>,
     delivered: BTreeMap<(ShortAddr, u16), Micros>,
     queue: Vec<Queued>,
+    hop_pending: Vec<HopPending>,
     outgoing: Vec<Outgoing>,
     events: VecDeque<Event>,
     next_id: u32,
@@ -174,6 +237,7 @@ impl Node {
             seen: BTreeMap::new(),
             delivered: BTreeMap::new(),
             queue: Vec::new(),
+            hop_pending: Vec::new(),
             outgoing: Vec::new(),
             events: VecDeque::new(),
             next_id,
@@ -193,6 +257,34 @@ impl Node {
     /// Known contacts as (address, name).
     pub fn contacts(&self) -> impl Iterator<Item = (Address, &str)> {
         self.contacts.values().map(|c| (c.addr, c.name.as_str()))
+    }
+
+    /// Add a contact shared out of band (QR code, contact file). No route is
+    /// known yet: the first message floods and the ACK returns a route.
+    /// Returns false on a short-address collision with a different contact.
+    pub fn add_contact(&mut self, public: &PublicIdentity, name: &str) -> bool {
+        let addr = public.address();
+        if addr == self.address() {
+            return false;
+        }
+        if let Some(c) = self.contacts.get(&addr.short()) {
+            return c.addr == addr;
+        }
+        let Some(key) = self.identity.pair_key(public) else {
+            return false;
+        };
+        self.contacts.insert(
+            addr.short(),
+            Contact {
+                addr,
+                name: name.into(),
+                role: Role::Client,
+                key,
+                route: None,
+                confirmed: false,
+            },
+        );
+        true
     }
 
     pub fn knows(&self, addr: &Address) -> bool {
@@ -230,6 +322,7 @@ impl Node {
         prio: u8,
         frame: Vec<u8>,
         flood_key: Option<(ShortAddr, u32)>,
+        hop: Option<HopWatch>,
     ) {
         self.queue.push(Queued {
             at,
@@ -237,7 +330,14 @@ impl Node {
             frame,
             flood_key,
             heard: 0,
+            hop,
         });
+    }
+
+    /// Wait after starting a transmission before deciding the hop failed.
+    fn hop_timeout(&self, len: usize) -> Micros {
+        let air = self.airtime(len + 1);
+        3 * air + air / 2 + 200_000
     }
 
     /// Flood an announce carrying this node's public keys, role and name.
@@ -264,7 +364,7 @@ impl Node {
             path: Vec::new(),
             payload,
         };
-        self.enqueue(now, PRIO_ANNOUNCE, packet.encode(), None);
+        self.enqueue(now, PRIO_ANNOUNCE, packet.encode(), None, None);
     }
 
     /// Send `data` reliably to `to` on `port`. Returns the message sequence number
@@ -279,7 +379,7 @@ impl Node {
         if self.contact(to).is_none() {
             return Err(SendError::UnknownContact);
         }
-        if HEADER_LEN + 1 + MAX_PATH + DATA_OVERHEAD + data.len() > MAX_FRAME {
+        if data.len() > MAX_DATA {
             return Err(SendError::TooLarge);
         }
         let seq = self.next_seq;
@@ -292,6 +392,7 @@ impl Node {
             attempts: 0,
             routed_attempts: 0,
             last_routed: false,
+            last_id: 0,
             deadline: now,
         });
         let i = self.outgoing.len() - 1;
@@ -318,9 +419,14 @@ impl Node {
             .as_ref()
             .map_or(self.config.hop_limit as usize, |r| r.len() + 1);
 
+        let confirmed = contact.confirmed;
         let id = self.alloc_id();
         let mut packet = Packet {
-            ptype: PacketType::Data,
+            ptype: if confirmed {
+                PacketType::Data
+            } else {
+                PacketType::DataKey
+            },
             routed,
             ack_req: true,
             hop_limit: self.config.hop_limit,
@@ -336,33 +442,56 @@ impl Node {
         buf.extend_from_slice(&port.to_be_bytes());
         buf.extend_from_slice(&self.outgoing[i].data);
         crypto::seal(&key, &packet.nonce(), &packet.aad(), &mut buf);
+        if !confirmed {
+            let mut keyed = Vec::with_capacity(PublicIdentity::LEN + buf.len());
+            keyed.extend_from_slice(&self.identity.public().to_bytes());
+            keyed.extend_from_slice(&buf);
+            buf = keyed;
+        }
         packet.payload = buf;
         let frame = packet.encode();
 
+        let hop = routed.then(|| {
+            let watch = if packet.path.is_empty() {
+                Watch::ReplyFrom(to)
+            } else {
+                Watch::Forwarded {
+                    key: (self.me, id),
+                    hop_count: 0,
+                }
+            };
+            HopWatch::new(watch, Some(id))
+        });
         let timeout = self.round_trip_timeout(frame.len(), hops);
         let jitter = self.rng.below(timeout / 4 + 1);
         let o = &mut self.outgoing[i];
         o.attempts += 1;
         o.last_routed = routed;
+        o.last_id = id;
         if routed {
             o.routed_attempts += 1;
         }
         o.deadline = now + timeout + jitter;
-        self.enqueue(now, PRIO_DATA, frame, None);
+        self.enqueue(now, PRIO_DATA, frame, None, hop);
     }
 
     /// Worst case for a packet to go `hops` hops and its ACK to come back.
     fn round_trip_timeout(&self, len: usize, hops: usize) -> Micros {
         let air = self.airtime(len);
         let ack_air = self.airtime(HEADER_LEN + 1 + MAX_PATH + 3 + MAX_PATH + crypto::TAG_LEN);
-        let per_hop = air + max_flood_delay(air) + ack_air + max_flood_delay(ack_air);
+        let per_hop = air
+            + max_flood_delay(air)
+            + ack_air
+            + max_flood_delay(ack_air)
+            + HOP_RETRIES as Micros * (self.hop_timeout(len) + self.hop_timeout(HEADER_LEN + 24))
+                / 2;
         hops as Micros * per_hop + TIMEOUT_MARGIN
     }
 
     fn flood_delay(&mut self, snr_db: f32, air: Micros) -> Micros {
         // Weaker SNR -> rebroadcast sooner: that node is likely further away and covers new ground.
         let w = ((snr_db + 20.0) / 30.0).clamp(0.0, 1.0);
-        (w * 2.0 * air as f32) as Micros + self.rng.below(air / 2 + 1)
+        (w * 2.0 * air as f32) as Micros + self.rng.below(2 * air + 1)
     }
 
     /// Process a frame received from the radio.
@@ -370,7 +499,18 @@ impl Node {
         let Ok(packet) = Packet::decode(frame) else {
             return;
         };
+        self.hop_pending
+            .retain(|h| !h.hop.watch.satisfied_by(&packet));
+        self.queue
+            .retain(|q| !q.hop.is_some_and(|h| h.watch.satisfied_by(&packet)));
         if packet.src == self.me {
+            return;
+        }
+        let for_me = packet.dst == self.me;
+        // A source-routed packet in transit only concerns the repeater named at
+        // its current hop. Overhearing it at an earlier hop must not mark it
+        // seen, or this repeater would drop it when its own turn comes.
+        if packet.routed && !for_me && !self.is_next_hop(&packet) {
             return;
         }
         let key = (packet.src, packet.id);
@@ -385,16 +525,23 @@ impl Node {
         }
         self.seen.insert(key, now + SEEN_TTL);
 
-        let for_me = packet.dst == self.me;
         match packet.ptype {
             PacketType::Announce => {
                 self.on_announce(&packet);
                 self.forward(packet, snr_db, now);
             }
-            PacketType::Data if for_me => self.on_data(&packet, now),
+            PacketType::Data | PacketType::DataKey if for_me => self.on_data(&packet, now),
             PacketType::Ack if for_me => self.on_ack(&packet),
             _ => self.forward(packet, snr_db, now),
         }
+    }
+
+    fn is_next_hop(&self, packet: &Packet) -> bool {
+        self.config.role == Role::Repeater
+            && packet
+                .path
+                .get(packet.hop_count as usize)
+                .is_some_and(|&t| t == self.me.tag())
     }
 
     fn forward(&mut self, mut packet: Packet, snr_db: f32, now: Micros) {
@@ -402,12 +549,36 @@ impl Node {
             return;
         }
         if packet.routed {
-            let idx = packet.hop_count as usize;
-            if idx < packet.path.len() && packet.path[idx] == self.me.tag() {
+            if self.is_next_hop(&packet) {
                 packet.hop_count += 1;
+                let hop = if (packet.hop_count as usize) < packet.path.len() {
+                    Some(Watch::Forwarded {
+                        key: (packet.src, packet.id),
+                        hop_count: packet.hop_count,
+                    })
+                } else if packet.ptype.is_data() {
+                    Some(Watch::ReplyFrom(packet.dst))
+                } else {
+                    None
+                };
                 let frame = packet.encode();
                 let jitter = self.rng.below(self.airtime(frame.len()) / 4 + 1);
-                self.enqueue(now + jitter, PRIO_FORWARD, frame, None);
+                if hop.is_none() && packet.ptype == PacketType::Ack {
+                    self.enqueue_final_ack(now + jitter, frame);
+                    return;
+                }
+                let prio = if packet.ptype == PacketType::Ack {
+                    PRIO_ACK
+                } else {
+                    PRIO_FORWARD
+                };
+                self.enqueue(
+                    now + jitter,
+                    prio,
+                    frame,
+                    None,
+                    hop.map(|w| HopWatch::new(w, None)),
+                );
             }
             return;
         }
@@ -426,7 +597,13 @@ impl Node {
             _ => PRIO_FORWARD,
         };
         let delay = self.flood_delay(snr_db, self.airtime(frame.len()));
-        self.enqueue(now + delay, prio, frame, Some((packet.src, packet.id)));
+        self.enqueue(
+            now + delay,
+            prio,
+            frame,
+            Some((packet.src, packet.id)),
+            None,
+        );
     }
 
     fn on_announce(&mut self, packet: &Packet) {
@@ -439,7 +616,8 @@ impl Node {
         if p.len() != body_len + 64 {
             return;
         }
-        let pub_bytes: &[u8; 64] = p[..64].try_into().expect("length checked");
+        let pub_bytes: &[u8; PublicIdentity::LEN] =
+            p[..PublicIdentity::LEN].try_into().expect("length checked");
         let Some(public) = PublicIdentity::from_bytes(pub_bytes) else {
             return;
         };
@@ -480,6 +658,7 @@ impl Node {
                         role,
                         key,
                         route,
+                        confirmed: false,
                     },
                 );
             }
@@ -487,15 +666,58 @@ impl Node {
     }
 
     fn on_data(&mut self, packet: &Packet, now: Micros) {
+        let mut buf = packet.payload.clone();
+        if packet.ptype == PacketType::DataKey {
+            if buf.len() < PublicIdentity::LEN {
+                return;
+            }
+            let ct = buf.split_off(PublicIdentity::LEN);
+            let pk: &[u8; PublicIdentity::LEN] = buf[..].try_into().expect("length checked");
+            let Some(public) = PublicIdentity::from_bytes(pk) else {
+                return;
+            };
+            if public.address().short() != packet.src {
+                return;
+            }
+            // Learn the sender if needed. The contact only becomes visible
+            // (and confirmed) once the payload below authenticates.
+            if !self.contacts.contains_key(&packet.src) {
+                let Some(key) = self.identity.pair_key(&public) else {
+                    return;
+                };
+                let mut probe = ct.clone();
+                if !crypto::open(&key, &packet.nonce(), &packet.aad(), &mut probe) {
+                    return;
+                }
+                let addr = public.address();
+                self.events.push_back(Event::Contact {
+                    addr,
+                    name: String::new(),
+                    role: Role::Client,
+                });
+                self.contacts.insert(
+                    packet.src,
+                    Contact {
+                        addr,
+                        name: String::new(),
+                        role: Role::Client,
+                        key,
+                        route: None,
+                        confirmed: false,
+                    },
+                );
+            }
+            buf = ct;
+        }
         let Some(contact) = self.contacts.get_mut(&packet.src) else {
             return;
         };
-        let mut buf = packet.payload.clone();
         if !crypto::open(&contact.key, &packet.nonce(), &packet.aad(), &mut buf) || buf.len() < 4 {
             return;
         }
         // Either way the packet's path, reversed, leads back to the sender.
         contact.route = Some(reversed(&packet.path));
+        contact.confirmed = true;
         let from = contact.addr;
         let seq = u16::from_be_bytes([buf[0], buf[1]]);
         let port = u16::from_be_bytes([buf[2], buf[3]]);
@@ -558,9 +780,31 @@ impl Node {
         }
         crypto::seal(&key, &packet.nonce(), &packet.aad(), &mut buf);
         packet.payload = buf;
+        let hop = (!packet.path.is_empty()).then(|| {
+            HopWatch::new(
+                Watch::Forwarded {
+                    key: (self.me, id),
+                    hop_count: 0,
+                },
+                None,
+            )
+        });
         let frame = packet.encode();
         let jitter = self.rng.below(self.airtime(frame.len()) / 4 + 1);
-        self.enqueue(now + jitter, PRIO_ACK, frame, None);
+        if packet.routed && hop.is_none() {
+            self.enqueue_final_ack(now + jitter, frame);
+        } else {
+            self.enqueue(now + jitter, PRIO_ACK, frame, None, hop);
+        }
+    }
+
+    /// The last hop of an ACK has no implicit acknowledgement (its destination
+    /// stays silent), so the ACK is sent twice with a gap instead.
+    fn enqueue_final_ack(&mut self, at: Micros, frame: Vec<u8>) {
+        let air = self.airtime(frame.len());
+        let gap = 2 * air + self.rng.below(2 * air + 1);
+        self.enqueue(at, PRIO_ACK, frame.clone(), None, None);
+        self.enqueue(at + gap, PRIO_ACK, frame, None, None);
     }
 
     fn on_ack(&mut self, packet: &Packet) {
@@ -571,6 +815,7 @@ impl Node {
         if !crypto::open(&contact.key, &packet.nonce(), &packet.aad(), &mut buf) || buf.len() < 3 {
             return;
         }
+        contact.confirmed = true;
         let seq = u16::from_be_bytes([buf[0], buf[1]]);
         if buf[2] == 1 && buf.len() - 3 <= MAX_PATH {
             contact.route = Some(buf[3..].to_vec());
@@ -594,6 +839,29 @@ impl Node {
             self.seen.retain(|_, exp| *exp > now);
             self.delivered.retain(|_, exp| *exp > now);
             self.last_prune = now;
+        }
+        let mut k = 0;
+        while k < self.hop_pending.len() {
+            if self.hop_pending[k].deadline > now {
+                k += 1;
+                continue;
+            }
+            let HopPending {
+                mut hop,
+                frame,
+                prio,
+                ..
+            } = self.hop_pending.remove(k);
+            if hop.retries_left > 0 {
+                hop.retries_left -= 1;
+                self.enqueue(now, prio, frame, None, Some(hop));
+            } else if let Some(id) = hop.own_data_id {
+                // Our first hop is dead: give up on the route and flood now.
+                if let Some(o) = self.outgoing.iter_mut().find(|o| o.last_id == id) {
+                    o.routed_attempts = o.routed_attempts.max(2);
+                    o.deadline = now;
+                }
+            }
         }
         let mut i = 0;
         while i < self.outgoing.len() {
@@ -632,14 +900,24 @@ impl Node {
             .filter(|(_, q)| q.at <= now)
             .min_by_key(|(_, q)| (q.prio, q.at))
             .map(|(i, _)| i)?;
-        Some(self.queue.remove(best).frame)
+        let q = self.queue.remove(best);
+        if let Some(hop) = q.hop {
+            self.hop_pending.push(HopPending {
+                hop,
+                frame: q.frame.clone(),
+                prio: q.prio,
+                deadline: now + self.hop_timeout(q.frame.len()),
+            });
+        }
+        Some(q.frame)
     }
 
     /// Earliest time at which [`Node::tick`] or [`Node::poll_transmit`] has work.
     pub fn next_wakeup(&self) -> Option<Micros> {
         let q = self.queue.iter().map(|q| q.at);
         let o = self.outgoing.iter().map(|o| o.deadline);
-        q.chain(o).min()
+        let h = self.hop_pending.iter().map(|h| h.deadline);
+        q.chain(o).chain(h).min()
     }
 
     pub fn poll_event(&mut self) -> Option<Event> {
@@ -660,7 +938,7 @@ fn reversed(path: &[u8]) -> Vec<u8> {
 }
 
 fn max_flood_delay(air: Micros) -> Micros {
-    2 * air + air / 2
+    4 * air
 }
 
 #[cfg(test)]
@@ -808,8 +1086,58 @@ mod tests {
         nodes[1].announce(0);
         run(&mut nodes, &[vec![1], vec![0]], 0, 1_000_000);
         a = nodes.remove(0);
-        assert_eq!(a.send(&b, 1, &[0; 250], 0), Err(SendError::TooLarge));
-        assert!(a.send(&b, 1, &[0; 200], 0).is_ok());
+        assert_eq!(
+            a.send(&b, 1, &[0; MAX_DATA + 1], 0),
+            Err(SendError::TooLarge)
+        );
+        assert!(a.send(&b, 1, &[0; MAX_DATA], 0).is_ok());
+        let frame = a.poll_transmit(0).unwrap();
+        assert!(frame.len() <= MAX_FRAME - 1 - MAX_PATH);
+    }
+
+    #[test]
+    fn first_message_carries_key_until_confirmed() {
+        // A has heard B's announce; B has never heard of A.
+        let mut nodes = vec![node(1, Role::Client), node(2, Role::Client)];
+        nodes[1].announce(0);
+        run(&mut nodes, &[vec![1], vec![0]], 0, 1_000_000);
+        let a = nodes[0].address();
+        let b = nodes[1].address();
+        assert!(!nodes[1].knows(&a));
+
+        let seq = nodes[0].send(&b, 1, b"first", 1_000_000).unwrap();
+        let frame = nodes[0].poll_transmit(1_000_000).unwrap();
+        assert_eq!(Packet::decode(&frame).unwrap().ptype, PacketType::DataKey);
+        nodes[1].handle_frame(&frame, 0.0, 1_001_000);
+        let ev = run(&mut nodes, &[vec![1], vec![0]], 1_001_000, 5_000_000);
+        assert!(nodes[1].knows(&a));
+        assert!(ev.contains(&(0, Event::Delivered { to: b, seq })));
+
+        // Confirmed by the ACK: later messages drop the 32-byte key.
+        nodes[0].send(&b, 1, b"second", 5_000_000).unwrap();
+        let frame = nodes[0].poll_transmit(5_000_000).unwrap();
+        assert_eq!(Packet::decode(&frame).unwrap().ptype, PacketType::Data);
+    }
+
+    #[test]
+    fn shared_contact_without_announces() {
+        // Contacts exchanged by QR code; no announces at all. A <-> R <-> B.
+        let mut nodes = vec![
+            node(1, Role::Client),
+            node(3, Role::Repeater),
+            node(2, Role::Client),
+        ];
+        let links = vec![vec![1], vec![0, 2], vec![1]];
+        let pa = *nodes[0].identity.public();
+        let pb = *nodes[2].identity.public();
+        assert!(nodes[0].add_contact(&pb, "b"));
+        assert!(nodes[2].add_contact(&pa, "a"));
+        let b = pb.address();
+        let seq = nodes[0].send(&b, 1, b"hello", 0).unwrap();
+        let ev = run(&mut nodes, &links, 0, 10_000_000);
+        assert_eq!(messages(&ev, 2), vec![b"hello".to_vec()]);
+        assert!(ev.contains(&(0, Event::Delivered { to: b, seq })));
+        assert_eq!(nodes[0].route_to(&b).map(|r| r.len()), Some(1));
     }
 
     #[test]
