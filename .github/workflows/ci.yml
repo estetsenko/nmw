@@ -53,6 +53,39 @@ jobs:
       - name: UI script parses
         run: node --check apps/desktop/ui/app.js
 
+  # The Heltec V4 firmware is outside the workspace: it builds for the
+  # ESP32-S3 (Xtensa) with Espressif's Rust toolchain.
+  firmware:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: firmware/heltec-v4
+    steps:
+      - uses: actions/checkout@v4
+      - uses: esp-rs/xtensa-toolchain@v1.6
+        with:
+          default: true
+          buildtargets: esp32s3
+          ldproxy: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: firmware/heltec-v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: espflash
+      - run: cargo fmt --check
+      - run: cargo clippy --release -- -D warnings
+      - run: cargo build --release
+      - name: Flashable image (bootloader, partition table and app at 0x0)
+        run: espflash save-image --chip esp32s3 --flash-size 16mb --merge --skip-padding target/xtensa-esp32s3-none-elf/release/nmw-heltec-v4 nmw-heltec-v4.bin
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nmw-heltec-v4-firmware
+          if-no-files-found: error
+          path: |
+            firmware/heltec-v4/nmw-heltec-v4.bin
+            firmware/heltec-v4/target/xtensa-esp32s3-none-elf/release/nmw-heltec-v4
+
   package:
     name: package (${{ matrix.name }})
     needs: [check, desktop]

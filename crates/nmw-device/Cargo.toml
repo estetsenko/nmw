@@ -1,0 +1,16 @@
+[package]
+name = "nmw-device"
+version = "0.1.0"
+description = "Board-independent NMW device logic: SX1262 driver, GPS parsing and the screen UI (no_std + alloc)"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+nmw-core = { path = "../nmw-core" }
+embedded-hal = "1.0"
+embedded-graphics = "0.8"
+libm = "0.2"
+
+[dev-dependencies]
+png = "0.18"
