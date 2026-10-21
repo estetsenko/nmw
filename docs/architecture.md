@@ -294,6 +294,7 @@ Group posts have no end-to-end ACK, so whoever sends or rebroadcasts one listens
 | M4 | Gateway daemon + relay server + bot SDK (Python) | Two meshes federated; a bot answers commands |
 | M5 | Voice notes; resource transfer; `burst` profile | 10 s voice note across 3 hops |
 | M6 | Live PTT on `fast` profile | Intelligible PTT across 2 hops |
+| M7 | Dual boot with MeshCore on the Heltec V4: a boot menu in its own flash slot (small custom ESP-IDF bootloader so it shows on every power-on), MeshCore and NMW in separate slots with separate storage; NMW moves its identity out of the shared `nvs` partition | Power on, pick MeshCore or NMW with the button, both keep their settings; firmware updates over USB only |
 
 ## 16. Open questions (answers change the design)
 
