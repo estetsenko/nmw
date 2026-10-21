@@ -16,6 +16,7 @@ pub mod file;
 pub mod identity;
 pub mod node;
 pub mod packet;
+pub mod position;
 mod rng;
 pub mod text;
 

@@ -1,8 +1,10 @@
 [workspace]
 resolver = "2"
-members = ["crates/nmw-core", "crates/nmw-sim", "crates/nmw-host", "apps/desktop/src-tauri"]
+# The firmware builds for the ESP32-S3 with its own toolchain; see firmware/heltec-v4.
+exclude = ["firmware/heltec-v4"]
+members = ["crates/nmw-core", "crates/nmw-sim", "crates/nmw-host", "crates/nmw-device", "apps/desktop/src-tauri"]
 # The desktop app needs system WebView libraries; build it with `-p nmw-desktop`.
-default-members = ["crates/nmw-core", "crates/nmw-sim", "crates/nmw-host"]
+default-members = ["crates/nmw-core", "crates/nmw-sim", "crates/nmw-host", "crates/nmw-device"]
 
 [workspace.package]
 edition = "2021"

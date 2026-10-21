@@ -12,6 +12,8 @@ The design is in [docs/architecture.md](docs/architecture.md).
 | `crates/nmw-core` | The protocol: packet codec, identities, ChaCha20-Poly1305, routing and reliable delivery. `no_std` + `alloc`, sans-IO, shared by firmware and apps. |
 | `crates/nmw-sim` | Deterministic multi-node simulator (airtime, collisions with capture, listen-before-talk, random loss). |
 | `crates/nmw-host` | Host-side runtime for apps, bots and gateways. Today it drives a simulated mesh with an Echo bot and an Info bot; a radio over USB plugs in behind the same `Mesh` trait. |
+| `crates/nmw-device` | Board-independent device logic: SX1262 driver, GPS (NMEA) reader, message inbox and the 128x64 screens. `no_std`, tested on the host. |
+| `firmware/heltec-v4` | Firmware for the Heltec V4: text messages and GPS on the OLED. Builds with Espressif's Rust toolchain, outside the workspace; see [its README](firmware/heltec-v4/README.md). |
 | `apps/desktop` | Tauri desktop app (Rust backend in `src-tauri`, plain HTML/JS UI in `ui`). |
 
 ## Build and test
@@ -67,4 +69,6 @@ wherever you choose.
 
 ## Status
 
-M0 (protocol core + simulator) is done. The desktop app works against the simulated mesh; Heltec V4 firmware (M1) is next once hardware is available, and then the app switches to a real radio over USB.
+M0 (protocol core + simulator) is done. The desktop app works against the simulated mesh. The first Heltec V4 firmware (M1) shows #public and direct messages and the GPS fix on the board's screen and shares positions; it is untested on hardware. Next: a USB link so the desktop app can use the board as its radio.
+
+To preview the board's screens without hardware: `cargo run -p nmw-device --example screens -- /tmp/screens`.

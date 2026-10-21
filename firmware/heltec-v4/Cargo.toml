@@ -1,0 +1,39 @@
+[package]
+edition      = "2024"
+name         = "nmw-heltec-v4"
+description  = "NMW firmware for the Heltec WiFi LoRa 32 V4 (ESP32-S3 + SX1262 + L76K GPS)"
+rust-version = "1.95"
+version      = "0.1.0"
+license      = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "nmw-heltec-v4"
+path = "./src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+nmw-core   = { path = "../../crates/nmw-core" }
+nmw-device = { path = "../../crates/nmw-device" }
+
+esp-hal                = { version = "~1.2.2", features = ["esp32s3", "log-04", "unstable"] }
+esp-bootloader-esp-idf = { version = "0.6.0", features = ["esp32s3", "log-04", "embedded-storage"] }
+esp-storage            = { version = "0.10.0", features = ["esp32s3"] }
+esp-alloc              = { version = "0.11.0", features = ["esp32s3"] }
+esp-backtrace          = { version = "0.20.0", features = ["esp32s3", "panic-handler", "println"] }
+esp-println            = { version = "0.18.0", features = ["esp32s3", "log-04"] }
+critical-section       = "1.2.0"
+log                    = "0.4.27"
+
+embedded-hal-bus = "0.3"
+ssd1306          = "0.10"
+
+# The default debug profile is too slow and too big for the chip.
+[profile.dev]
+opt-level = "s"
+
+[profile.release]
+codegen-units = 1
+debug         = 2
+lto           = "fat"
+opt-level     = "s"
