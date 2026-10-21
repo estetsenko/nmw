@@ -293,8 +293,8 @@ function fileBubble(m) {
     b.append(bar);
   }
   if (m.dir === 'in' && f.data) {
-    const save = el('button', 'ghost small save', m.saved ? 'Saved' : 'Save');
-    save.title = m.saved || 'Save to Downloads';
+    const save = el('button', 'ghost small save', m.saved ? 'Saved' : 'Save…');
+    save.title = m.saved || 'Choose where to save this file';
     save.addEventListener('click', () => saveFile(m));
     b.append(save);
   }
@@ -336,7 +336,9 @@ function updateFile(peer, id, dir, change) {
 
 async function saveFile(m) {
   try {
-    m.saved = await invoke('save_file', { name: m.file.name, data: m.file.data });
+    // null: the save dialog was cancelled.
+    const path = await invoke('save_file', { name: m.file.name, data: m.file.data });
+    if (path) m.saved = path;
     showError('send-error');
   } catch (err) {
     showError('send-error', String(err));

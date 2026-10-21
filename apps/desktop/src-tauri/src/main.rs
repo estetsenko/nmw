@@ -13,6 +13,7 @@ use rand::RngCore;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use tauri::{Emitter, Manager, State};
+use tauri_plugin_dialog::DialogExt;
 
 struct AppState {
     runtime: Runtime,
@@ -92,17 +93,28 @@ fn send_file(
     state.runtime.with(|m| m.send_file(&to, &name, &mime, data))
 }
 
-/// Save a received file in the Downloads folder under a name not taken yet.
-/// Returns the path it was saved to.
+/// Ask where to save a received file, starting in Downloads with the
+/// sender's name (cleaned) suggested, and write it there. Returns the path,
+/// or `None` if the dialog was cancelled.
 #[tauri::command]
-fn save_file(app: tauri::AppHandle, name: String, data: String) -> Result<String, String> {
+async fn save_file(
+    app: tauri::AppHandle,
+    name: String,
+    data: String,
+) -> Result<Option<String>, String> {
     let data = B64
         .decode(data)
         .map_err(|e| format!("bad file data: {e}"))?;
-    let dir = app.path().download_dir().map_err(|e| e.to_string())?;
-    let path = free_path(&dir, &safe_file_name(&name));
+    let mut dialog = app.dialog().file().set_file_name(safe_file_name(&name));
+    if let Ok(dir) = app.path().download_dir() {
+        dialog = dialog.set_directory(dir);
+    }
+    let Some(picked) = dialog.blocking_save_file() else {
+        return Ok(None);
+    };
+    let path = picked.into_path().map_err(|e| e.to_string())?;
     std::fs::write(&path, data).map_err(|e| format!("could not save {}: {e}", path.display()))?;
-    Ok(path.display().to_string())
+    Ok(Some(path.display().to_string()))
 }
 
 /// The sender picks the name, so keep only its last path component.
@@ -118,22 +130,6 @@ fn safe_file_name(name: &str) -> String {
     } else {
         clean.into()
     }
-}
-
-/// `dir/name`, or `dir/stem (2).ext` and so on if that exists.
-fn free_path(dir: &Path, name: &str) -> PathBuf {
-    let path = dir.join(name);
-    if !path.exists() {
-        return path;
-    }
-    let (stem, ext) = match name.rsplit_once('.') {
-        Some((s, e)) if !s.is_empty() => (s, format!(".{e}")),
-        _ => (name, String::new()),
-    };
-    (2..)
-        .map(|n| dir.join(format!("{stem} ({n}){ext}")))
-        .find(|p| !p.exists())
-        .expect("some name is free")
 }
 
 #[tauri::command]
@@ -172,6 +168,7 @@ fn load_channels(path: &Path) -> Vec<ChannelInfo> {
 
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
             let seed = load_or_create_seed(&data_dir)?;
@@ -220,7 +217,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn received_file_names_stay_in_the_folder() {
+    fn received_file_names_are_cleaned() {
         assert_eq!(safe_file_name("photo.jpg"), "photo.jpg");
         assert_eq!(safe_file_name("../../etc/passwd"), "passwd");
         assert_eq!(safe_file_name("C:\\x\\evil.exe"), "evil.exe");
@@ -228,17 +225,5 @@ mod tests {
         assert_eq!(safe_file_name(""), "file");
         assert_eq!(safe_file_name("a/"), "file");
         assert_eq!(safe_file_name("we<i>rd?.txt"), "weird.txt");
-    }
-
-    #[test]
-    fn free_path_adds_a_number() {
-        let dir = std::env::temp_dir().join(format!("nmw-free-path-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        assert_eq!(free_path(&dir, "a.txt"), dir.join("a.txt"));
-        std::fs::write(dir.join("a.txt"), "x").unwrap();
-        assert_eq!(free_path(&dir, "a.txt"), dir.join("a (2).txt"));
-        std::fs::write(dir.join("noext"), "x").unwrap();
-        assert_eq!(free_path(&dir, "noext"), dir.join("noext (2)"));
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
