@@ -62,8 +62,8 @@ shows how many parts it will take.
 
 The paperclip button sends a photo or file (up to 32 KB) to a contact. Photos
 are shrunk to about 12 KB first, since each kilobyte takes roughly 10 seconds
-per radio hop. Echo bot sends files back, and received files can be saved to
-the Downloads folder.
+per radio hop. Echo bot sends files back, and received files can be saved
+wherever you choose.
 
 ## Status
 
