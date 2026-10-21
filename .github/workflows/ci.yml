@@ -1,8 +1,9 @@
 name: CI
 
 # Packages for Linux, macOS and Windows are built only after `check` and
-# `desktop` pass, and uploaded as workflow artifacts. A pushed `v*` tag also
-# attaches them to a draft GitHub release. Packages are not code-signed yet.
+# `desktop` pass; the Heltec V4 firmware builds in parallel. Both are uploaded
+# as workflow artifacts, and a pushed `v*` tag also attaches them to a draft
+# GitHub release. Packages are not code-signed yet.
 
 on:
   push:
@@ -57,6 +58,8 @@ jobs:
   # ESP32-S3 (Xtensa) with Espressif's Rust toolchain.
   firmware:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     defaults:
       run:
         working-directory: firmware/heltec-v4
@@ -85,6 +88,12 @@ jobs:
           path: |
             firmware/heltec-v4/nmw-heltec-v4.bin
             firmware/heltec-v4/target/xtensa-esp32s3-none-elf/release/nmw-heltec-v4
+      - name: Attach to draft release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: firmware/heltec-v4/nmw-heltec-v4.bin
 
   package:
     name: package (${{ matrix.name }})
@@ -153,11 +162,16 @@ jobs:
             ${{ matrix.bundle }}/nsis/*.exe
 
   # Every push to main replaces the "Latest build" pre-release with the
-  # packages from this run, so the newest installers are one click away
-  # without signing in. Tagged versions keep their own draft releases.
+  # desktop packages and the Heltec V4 firmware from this run, so the newest
+  # builds are one click away without signing in. The firmware needs only
+  # the protocol tests (`check`) and its own build, so a broken desktop
+  # package does not hold it back: the release then carries what built.
+  # Tagged versions keep their own draft releases.
   publish-latest:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: package
+    if: >-
+      !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+      && needs.check.result == 'success' && needs.firmware.result == 'success'
+    needs: [check, firmware, package]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -169,15 +183,27 @@ jobs:
       GH_REPO: ${{ github.repository }}
     steps:
       - uses: actions/download-artifact@v4
+        # None exist when the desktop packages failed.
+        continue-on-error: true
         with:
           pattern: nmw-desktop-*
           path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: nmw-heltec-v4-firmware
+          path: firmware
       - name: Replace the Latest build release
         run: |
+          missing=""
+          [ "${{ needs.package.result }}" = success ] || missing=" Desktop packages failed to build in this run, so only the firmware is attached."
           gh release delete latest-build --cleanup-tag --yes || true
           gh release create latest-build \
             --prerelease \
             --target "$GITHUB_SHA" \
             --title "Latest build" \
-            --notes "Desktop packages built from main at ${GITHUB_SHA::7}. Not code-signed: on macOS use System Settings > Privacy & Security > Open Anyway on first launch." \
-            $(find dist -type f)
+            --notes "Built from main at ${GITHUB_SHA::7}.${missing}
+
+          Desktop packages are not code-signed: on macOS use System Settings > Privacy & Security > Open Anyway on first launch.
+
+          nmw-heltec-v4.bin is the Heltec V4 firmware, untested on hardware yet. Flash it at 0x0: espflash write-bin 0x0 nmw-heltec-v4.bin" \
+            $(find dist -type f 2>/dev/null) firmware/nmw-heltec-v4.bin

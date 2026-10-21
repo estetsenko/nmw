@@ -34,8 +34,11 @@ digits of the address.
 
 ## Flashing a CI build
 
-Every CI run uploads `nmw-heltec-v4-firmware` with `nmw-heltec-v4.bin`, a
-merged image for offset 0x0. Flash it with
+The newest `nmw-heltec-v4.bin` from main is on the
+[Latest build](https://github.com/estetsenko/nmw/releases/tag/latest-build)
+release; every CI run (PRs too) also uploads it as the
+`nmw-heltec-v4-firmware` artifact. It is a merged image for offset 0x0.
+Flash it with
 [espflash](https://github.com/esp-rs/espflash) or esptool:
 
 ```sh
